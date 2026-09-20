@@ -434,7 +434,7 @@ flags that are dangerous:
 against `vet()`, so a regression shows up as a failing case rather than as a
 surprise.
 
-### A window title is not a instruction
+### A window title is not an instruction
 
 The planner is told which windows are open so that "close the flights window"
 can find the right one. A window title is set by whatever runs in that window,
