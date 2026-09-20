@@ -1,0 +1,67 @@
+#!/bin/bash
+
+# omarchy:summary=Show or change whether the wake word listener starts at login
+# omarchy:args=[on|off] [--json]
+# omarchy:examples=omarchy-voice-autostart | omarchy-voice-autostart off
+
+# Whether the listener comes back on its own after a reboot.
+#
+# This is a different question from whether it is listening right now, and the
+# two are easy to confuse:
+#
+#   listening now    systemctl --user start|stop     omarchy-voice-wake-toggle
+#   starts at login  systemctl --user enable|disable  this
+#
+# Stopping it lasts until the next login. Disabling it lasts until you say
+# otherwise. Someone who stops it to get their headset back and then reboots
+# would be surprised to find it listening again, and someone who disables it
+# expecting silence right now would be surprised to find it still running - so
+# both are reported together, and neither is silently changed to match the other.
+#
+#     omarchy-voice-autostart           what it does now, both answers
+#     omarchy-voice-autostart --json    the same, for the bar widget
+#     omarchy-voice-autostart on        come back after a reboot
+#     omarchy-voice-autostart off       stay off until started by hand
+
+set -uo pipefail
+
+UNIT="omarchy-voice-wake"
+
+# `is-enabled` exits non-zero for "disabled", which is an answer rather than a
+# failure, so the status is read from its output instead of its exit code.
+enabled=$(systemctl --user is-enabled "$UNIT" 2>/dev/null || true)
+active=$(systemctl --user is-active "$UNIT" 2>/dev/null || true)
+[[ -n $enabled ]] || enabled="unknown"
+[[ -n $active ]] || active="unknown"
+
+case "${1:-}" in
+  on|enable|yes|true)
+    systemctl --user enable "$UNIT" >/dev/null 2>&1 ||
+      { echo "could not enable $UNIT" >&2; exit 1; }
+    echo "starts at login: yes"
+    # Deliberately not started here. Turning on the thing that survives a reboot
+    # is not the same as asking for it right now, and doing both would take the
+    # microphone from someone who only asked about next time.
+    [[ $active == "active" ]] || echo "  (not listening right now: omarchy-voice-wake-toggle)"
+    ;;
+  off|disable|no|false)
+    systemctl --user disable "$UNIT" >/dev/null 2>&1 ||
+      { echo "could not disable $UNIT" >&2; exit 1; }
+    echo "starts at login: no"
+    [[ $active == "active" ]] && echo "  (still listening until you stop it or log out)"
+    ;;
+  --json)
+    printf '{\n  "enabled": %s,\n  "active": %s,\n  "enabled_raw": "%s",\n  "active_raw": "%s"\n}\n' \
+      "$([[ $enabled == "enabled" ]] && echo true || echo false)" \
+      "$([[ $active == "active" ]] && echo true || echo false)" \
+      "$enabled" "$active"
+    ;;
+  ""|show|status)
+    echo "starts at login:  $([[ $enabled == "enabled" ]] && echo yes || echo no)   ($enabled)"
+    echo "listening now:    $([[ $active == "active" ]] && echo yes || echo no)   ($active)"
+    ;;
+  *)
+    echo "usage: omarchy-voice-autostart [on|off] [--json]" >&2
+    exit 1
+    ;;
+esac

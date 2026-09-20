@@ -43,6 +43,7 @@ Panel {
   property var sinks: []
   property string configuredOutput: ""
   property bool speaks: true
+  property bool autostart: true
 
   readonly property bool listening: !!state && state.listening === true
   readonly property string openMic: state ? String(state.mic || "") : ""
@@ -110,6 +111,22 @@ Panel {
   }
 
   Process {
+    id: autoRead
+    running: false
+    command: ["omarchy-voice-autostart", "--json"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          root.autostart = JSON.parse(String(text || "{}")).enabled === true
+        } catch (e) {
+          root.autostart = true
+        }
+      }
+    }
+  }
+
+  Process {
     id: toggleListening
     running: false
     command: ["omarchy-voice-wake-toggle"]
@@ -133,6 +150,12 @@ Panel {
 
   function refresh() {
     if (!micList.running) micList.running = true
+    if (!autoRead.running) autoRead.running = true
+  }
+
+  function setAutostart(on) {
+    setDevice.command = ["omarchy-voice-autostart", on ? "on" : "off"]
+    setDevice.running = true
   }
 
   function setSpeech(on) {
@@ -280,6 +303,37 @@ Panel {
               fontFamily: root.fontFamily
               bordered: true
               onClicked: root.setSpeech(!root.speaks)
+            }
+          }
+
+          // ---------- Starts at login ----------
+          Row {
+            width: parent.width
+            spacing: Style.space(10)
+
+            Text {
+              width: parent.width - autoToggle.width - Style.space(10)
+              // Says what it does *next time*, because the whole point of this
+              // switch is the thing you cannot observe right now. Stopping it
+              // lasts until the next login; this lasts until you change it.
+              text: root.autostart
+                    ? "Starts listening again after a reboot."
+                    : "Stays off after a reboot until you start it."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              textFormat: Text.PlainText
+              wrapMode: Text.WordWrap
+            }
+
+            PanelActionButton {
+              id: autoToggle
+              iconText: root.autostart ? "󰐦" : "󰐥"
+              tooltipText: root.autostart ? "Do not start at login" : "Start at login"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              bordered: true
+              onClicked: root.setAutostart(!root.autostart)
             }
           }
 

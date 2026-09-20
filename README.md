@@ -342,7 +342,7 @@ word is listening; click it for the panel.
 
 | | |
 |---|---|
-| top | stop or start listening, and turn speech on or off |
+| top | stop or start listening, turn speech on or off, and choose whether it comes back after a reboot |
 | microphone | which one it hears on, ticked on the one actually open |
 | speaker | which one it answers through, or the system default |
 
@@ -387,6 +387,29 @@ now. Only built-in inputs are probed - opening a capture stream on a Bluetooth
 headset would drag it onto its call-quality profile, which is the exact thing
 the rest of this goes out of its way to avoid.
 
+### Coming back after a reboot
+
+    omarchy-voice-autostart           what it does now, both answers
+    omarchy-voice-autostart off       stay off until started by hand
+    omarchy-voice-autostart on        come back on its own
+
+This is a different question from whether it is listening right now, and the two
+are easy to confuse:
+
+| | lasts until | command |
+|---|---|---|
+| listening now | the next login | `omarchy-voice-wake-toggle` |
+| starts at login | you change it | `omarchy-voice-autostart` |
+
+Neither silently changes the other. Someone who stops it to get their headset
+back and then reboots would be surprised to find it listening again; someone who
+turns this off expecting silence *now* would be surprised to find it still
+running. So both are always reported together, and turning this on does not take
+the microphone from you on the spot.
+
+`install.sh` leaves it on, which is the useful default for something whose whole
+point is being there when you speak.
+
 ### Turning speech off
 
     omarchy-voice-audio speech off
@@ -411,6 +434,7 @@ places - one is a room full of people, the other is a meeting.
     bin/omarchy-voice-browser      a Chromium profile voice is allowed to drive
     bin/omarchy-browser-control    acts inside that page: click, type, dismiss
     bin/omarchy-voice-audio        which microphone it hears on, which speaker it answers through
+    bin/omarchy-voice-autostart    whether it comes back after a reboot
     plugins/marvin/                the bar widget: state, and one click to change either
     bin/omarchy-voice-wake-test    detector regression suite, scores real audio
     bin/omarchy-voice-wake-check   post-boot health check
