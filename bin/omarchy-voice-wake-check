@@ -1,0 +1,146 @@
+#!/bin/bash
+
+# omarchy:summary=Check the wake word listener came up healthy on this boot
+# omarchy:examples=omarchy-voice-wake-check
+
+# Written to be run after a reboot. Everything it looks at is specific to the
+# current boot, so a clean result here means the listener started correctly this
+# time rather than at some point in the past.
+
+set -uo pipefail
+fail=0
+
+# Both the name and the phrase to try come from the config, so this check tells
+# you to say whatever this machine is actually listening for.
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/voice-wake.json"
+WAKE_PHRASE="hey marvin"
+if command -v jq >/dev/null 2>&1 && [[ -r $CONFIG_FILE ]]; then
+  WAKE_PHRASE=$(jq -r '(.wake_words[0] // "hey marvin")' "$CONFIG_FILE" 2>/dev/null) || WAKE_PHRASE="hey marvin"
+fi
+# "hey marvin" -> "Hey Marvin"
+WAKE_PHRASE_TITLE=$(echo "$WAKE_PHRASE" | sed -E 's/(^| )(.)/\1\u\2/g')
+AGENT_NAME=${WAKE_PHRASE_TITLE##* }
+ok()   { printf '  \033[32mok\033[0m    %s\n' "$1"; }
+bad()  { printf '  \033[31mFAIL\033[0m  %s\n' "$1"; fail=1; }
+# Degraded but working. Reporting this as a failure would mean the check goes
+# red whenever the headset is simply switched off, which trains you to ignore it.
+warn() { printf '  \033[33mwarn\033[0m  %s\n' "$1"; }
+note() { printf '        %s\n' "$1"; }
+
+echo "$AGENT_NAME, boot $(journalctl --list-boots --no-pager 2>/dev/null | tail -1 | awk '{print $1}')"
+echo
+
+# 1. Running at all. This is what the missing-PATH bug broke: the service died
+#    on the first thing you said and systemd restarted it two seconds later.
+if systemctl --user is-active --quiet omarchy-voice-wake; then
+  ok "service is active"
+else
+  bad "service is not active — systemctl --user status omarchy-voice-wake"
+fi
+
+restarts=$(systemctl --user show omarchy-voice-wake -p NRestarts --value 2>/dev/null)
+if [[ ${restarts:-0} -eq 0 ]]; then
+  ok "no restarts this boot"
+else
+  bad "restarted $restarts time(s) this boot — something is still crashing it"
+fi
+
+# 2. The exact crash that used to happen on the first command after every boot.
+if journalctl --user -u omarchy-voice-wake -b --no-pager 2>/dev/null |
+     grep -qE 'FileNotFoundError|Traceback'; then
+  bad "there is a traceback in this boot's log"
+  journalctl --user -u omarchy-voice-wake -b --no-pager | grep -E 'Error|Traceback' | tail -3 | sed 's/^/        /'
+else
+  ok "no traceback this boot"
+fi
+
+# 3. Did it reach the listening state, and on which microphone.
+listen=$(journalctl --user -u omarchy-voice-wake -b --no-pager 2>/dev/null | grep 'listening for' | tail -1)
+if [[ -n $listen ]]; then
+  ok "reached the listening state"
+  note "${listen#*: }"
+else
+  bad "never printed 'listening for' — it did not finish starting"
+fi
+
+gate=$(journalctl --user -u omarchy-voice-wake -b --no-pager 2>/dev/null | grep 'wake at score' | tail -1)
+[[ -n $gate ]] && note "${gate#*: }"
+
+# The detector lives in its own virtualenv because onnxruntime is not installed
+# system-wide; without it the listener cannot start at all.
+oww=$HOME/.local/share/omarchy-wakeword/venv/bin/python
+if [[ -x $oww ]] && "$oww" -c 'import openwakeword' 2>/dev/null; then
+  ok "wake word detector available"
+else
+  bad "openwakeword virtualenv is missing or broken ($oww)"
+fi
+
+# 4. The Bluetooth headset is the usual reason this boot differs from the last.
+if journalctl --user -u omarchy-voice-wake -b --no-pager 2>/dev/null | grep -q 'never appeared'; then
+  warn "the configured microphone was absent; listening on a built-in one"
+  note "$(journalctl --user -u omarchy-voice-wake -b --no-pager | grep 'never appeared' | tail -1 | sed 's/.*: //')"
+else
+  ok "configured microphone was present"
+fi
+
+# 5. Everything the dispatcher shells out to has to be on the SERVICE's PATH,
+#    not on yours - that distinction is exactly what broke it after the last
+#    boot, and checking it from this shell would have missed it entirely.
+svc_path=$(systemctl --user show omarchy-voice-wake -p Environment --value 2>/dev/null |
+             tr ' ' '\n' | sed -n 's/^PATH=//p')
+if [[ -z $svc_path ]]; then
+  main=$(systemctl --user show omarchy-voice-wake -p MainPID --value 2>/dev/null)
+  [[ -r /proc/$main/environ ]] &&
+    svc_path=$(tr '\0' '\n' </proc/"$main"/environ | sed -n 's/^PATH=//p')
+fi
+
+if [[ -z $svc_path ]]; then
+  bad "could not determine the service's PATH"
+else
+  missing=""
+  for c in omarchy-voice-command omarchy-voice-plan omarchy-voice-browser omarchy \
+           omarchy-window voxtype claude pw-record omarchy-notification-send; do
+    PATH="$svc_path" command -v "$c" >/dev/null 2>&1 || missing+=" $c"
+  done
+  if [[ -z $missing ]]; then
+    ok "the whole command chain resolves on the service's PATH"
+  else
+    bad "not on the service's PATH:$missing"
+  fi
+fi
+
+# 6. Speech. Optional, so a missing voice is reported rather than failed.
+speak_on=$(python3 -c "
+import json,pathlib
+try: print(json.load(open(pathlib.Path.home()/'.config/omarchy/voice-wake.json')).get('speak', True))
+except Exception: print(True)" 2>/dev/null)
+if [[ $speak_on == "False" ]]; then
+  note "speech is turned off (speak: false in voice-wake.json)"
+else
+  voice=$(python3 -c "
+import json,pathlib
+try: print(json.load(open(pathlib.Path.home()/'.config/omarchy/voice-wake.json')).get('voice','en_GB-alan-medium'))
+except Exception: print('en_GB-alan-medium')" 2>/dev/null)
+  if [[ -x $HOME/.local/share/piper/piper && -f $HOME/.local/share/piper/voices/$voice.onnx ]]; then
+    ok "voice available ($voice)"
+  else
+    bad "speech is on but the piper voice '$voice' is missing"
+  fi
+fi
+
+# 7. The detector still separates the wake phrase from everything else.
+if command -v omarchy-voice-wake-test >/dev/null 2>&1; then
+  if omarchy-voice-wake-test >/dev/null 2>&1; then
+    ok "wake detector scores well above threshold"
+  else
+    bad "wake detector test FAILED — omarchy-voice-wake-test"
+  fi
+fi
+
+echo
+if [[ $fail -eq 0 ]]; then
+  echo "All good. Say “$WAKE_PHRASE_TITLE, open the browser” to confirm end to end."
+else
+  echo "Something is off above. Full log: journalctl --user -u omarchy-voice-wake -b"
+fi
+exit $fail

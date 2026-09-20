@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+
+# omarchy:summary=Score the wake word detector against real audio, positive and negative
+# omarchy:args=[--threshold <0-1>] [--wav <file>]
+# omarchy:examples=omarchy-voice-wake-test | omarchy-voice-wake-test --threshold 0.7
+
+"""Regression test for the wake word detector.
+
+The previous version of this tested string matching, because detection used to
+be a speech recogniser driven by a one-phrase grammar and all the interesting
+logic was in deciding what its hypotheses meant. That is gone: detection is now
+a model that scores audio, so the only test worth running feeds it audio.
+
+Positives are synthesised with the same piper voice the assistant speaks in,
+plus the last thing you actually said to it if that recording is still around.
+Negatives are the phrases that provably fooled the old grammar - taken from the
+journal - the near neighbours of the current wake word, and a broadband burst
+standing in for a cough.
+
+It reports the *margin*, not just pass or fail. A detector whose best negative
+sits just under the threshold is one quiet room away from regressing, and that
+is worth knowing before it happens rather than after.
+
+    omarchy-voice-wake-test
+    omarchy-voice-wake-test --threshold 0.7    # try a stricter bar
+    omarchy-voice-wake-test --wav some.wav     # score one recording
+"""
+
+import argparse
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import wave
+
+VENV = pathlib.Path.home() / ".local/share/omarchy-wakeword/venv/bin/python"
+try:
+    import numpy as np
+    from openwakeword.model import Model
+    from scipy.signal import resample_poly
+except ImportError:
+    if VENV.exists() and os.environ.get("OMARCHY_WAKE_REEXEC") != "1":
+        os.environ["OMARCHY_WAKE_REEXEC"] = "1"
+        os.execv(str(VENV), [str(VENV), os.path.abspath(__file__), *sys.argv[1:]])
+    sys.exit(f"openwakeword is missing and no virtualenv at {VENV}")
+
+import warnings  # noqa: E402
+
+warnings.filterwarnings("ignore", message=".*CUDAExecutionProvider.*")
+
+CONFIG = pathlib.Path.home() / ".config/omarchy/voice-wake.json"
+WAKE_DIR = pathlib.Path.home() / ".local/share/omarchy-wakeword"
+PIPER = pathlib.Path.home() / ".local/share/piper"
+LAST_WAV = pathlib.Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "omarchy-voice/wake-command.wav"
+FRAME = 1280
+
+# Two kinds of negative, and both earn their place. The first four appear in the
+# journal as something the old grammar-based detector either woke on, or
+# transcribed while waking on something else; they are kept verbatim because a
+# detector that regresses on them has regressed on real recorded failures.
+#
+# The rest are near neighbours of the *current* wake word - the name inside an
+# ordinary sentence, the name alone, and the nearest common English word to it.
+# Change the wake word and these three change with it, because near-neighbour
+# discrimination is the property that has to be re-earned, not inherited.
+NEGATIVES = [
+    "job is stopped now",
+    "open the browser",
+    "so what next shall we do",
+    "thank you, I will see you in the next video",
+    "the marvin file is open",
+    "marvin",
+    "marvellous, that worked",
+    "stop listening",
+]
+POSITIVES = ["Hey Marvin", "Hey Marvin, open the browser", "Hey Marvin, what's the weather"]
+
+
+def config():
+    try:
+        return json.loads(CONFIG.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def find_model(name):
+    for root in (WAKE_DIR, pathlib.Path(sys.prefix)):
+        for path in root.rglob(f"{name}.onnx"):
+            return str(path)
+    sys.exit(f"no wake model {name}.onnx under {WAKE_DIR}")
+
+
+def read_wav(path):
+    with wave.open(str(path)) as handle:
+        pcm = np.frombuffer(handle.readframes(handle.getnframes()), dtype=np.int16)
+        rate = handle.getframerate()
+    if rate != 16000:
+        pcm = resample_poly(pcm.astype(np.float64), 16000, rate).astype(np.int16)
+    return pcm
+
+
+def say(text, out):
+    """Synthesise with the same voice the assistant speaks in, padded with silence."""
+    voice = PIPER / "voices" / f"{config().get('voice', 'en_GB-alan-medium')}.onnx"
+    if not (PIPER / "piper").exists() or not voice.exists():
+        return None
+    subprocess.run([str(PIPER / "piper"), "--model", str(voice), "--output_file", str(out)],
+                   input=text, text=True, capture_output=True,
+                   env={**os.environ, "LD_LIBRARY_PATH": str(PIPER)})
+    if not out.exists():
+        return None
+    pad = np.zeros(8000, dtype=np.int16)
+    return np.concatenate([pad, read_wav(out), pad])
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--threshold", type=float, help="try a bar without editing the config")
+    ap.add_argument("--wav", help="score a single recording and stop")
+    args = ap.parse_args()
+
+    cfg = config()
+    name = cfg.get("wake_model", "hey_marvin_v0.1")
+    threshold = args.threshold if args.threshold is not None else float(cfg.get("wake_threshold", 0.5))
+    wake_frames = max(1, int(cfg.get("wake_frames") or 3))
+    detector = Model(wakeword_model_paths=[find_model(name)])
+    key = next(iter(detector.models))
+    # What a freshly built model starts with, kept so it can be restored.
+    # Recomputing it means pushing ten seconds of silence through two models.
+    blank_features = detector.preprocessor.feature_buffer.copy()
+
+    def full_reset():
+        """Clear the detector's memory of audio, not merely of its own scores.
+
+        Model.reset() empties the prediction buffer and stops there, so up to a
+        second of the previous phrase stays in the mel and embedding buffers.
+        Scoring phrases back to back then measures each one against the tail of
+        the one before: run these cases in order and a negative inherits the
+        wake phrase from the positive ahead of it and scores 0.97.
+        """
+        detector.reset()
+        pre = detector.preprocessor
+        pre.melspectrogram_buffer = np.ones((76, 32))
+        pre.feature_buffer = blank_features.copy()
+        pre.accumulated_samples = 0
+        pre.raw_data_buffer.clear()
+
+    def score(pcm):
+        """Peak score, and the longest run of consecutive frames above threshold.
+
+        The run is what gets asserted. Peak alone was not separable on an
+        earlier model measured here: across fifteen synthesised samples the
+        name inside an ordinary sentence peaked at 0.994 while a real wake
+        bottomed out at 0.995, so any threshold drawn between them was drawn
+        through noise, and a suite built on it flapped run to run. hey_marvin
+        does separate on peak, but the assertion stays on held frames so the
+        suite keeps its meaning if the wake word changes again.
+        Held frames divide the same audio cleanly - six to eight against nought
+        or one - which is why the listener now wakes on duration too.
+        """
+        full_reset()
+        best, run, longest = 0.0, 0, 0
+        for i in range(0, len(pcm) - FRAME, FRAME):
+            value = float(detector.predict(pcm[i:i + FRAME])[key])
+            best = max(best, value)
+            run = run + 1 if value >= threshold else 0
+            longest = max(longest, run)
+        return best, longest
+
+    if args.wav:
+        peak, held = score(read_wav(args.wav))
+        print(f"{peak:.3f} peak, held {held} frames  {args.wav}")
+        return 0
+
+    tmp = pathlib.Path(os.environ.get("TMPDIR", "/tmp")) / "omarchy-wake-test.wav"
+    print(f"model            {name}")
+    print(f"threshold        {threshold}")
+    print(f"frames to wake   {wake_frames}\n")
+
+    failed, best_negative, worst_positive = 0, 0, 10 ** 6  # held-frame counts
+
+    # Reported, never asserted. This file is whatever was last said to the assistant,
+    # so its contents change under the test's feet: a follow-up carries no wake
+    # word at all, and a clipped recording carries half of one. Failing on that
+    # is failing for a reason that has nothing to do with the detector, and a
+    # suite that cries wolf is worse than no suite. The assertions below run on
+    # synthesised audio, which is the same every time.
+    if LAST_WAV.exists():
+        try:
+            peak, held = score(read_wav(LAST_WAV))
+            print(f"  LIVE (for information, not asserted)\n"
+                  f"    {peak:.3f} peak, held {held}  your own voice, last command\n")
+        except (OSError, wave.Error, ValueError):
+            pass
+
+    print("  POSITIVES (must score at or above the threshold)")
+    for text in POSITIVES:
+        pcm = say(text, tmp)
+        if pcm is None:
+            print("    SKIP  piper unavailable, cannot synthesise positives")
+            break
+        peak, held = score(pcm)
+        worst_positive = min(worst_positive, held)
+        ok = held >= wake_frames
+        failed += not ok
+        print(f"    {'PASS' if ok else 'FAIL'}  held {held:>2}  (peak {peak:.3f})  {text!r}")
+
+    print("\n  NEGATIVES (journal failures, and near neighbours of the wake word)")
+    for text in NEGATIVES:
+        pcm = say(text, tmp)
+        if pcm is None:
+            break
+        peak, held = score(pcm)
+        best_negative = max(best_negative, held)
+        ok = held < wake_frames
+        failed += not ok
+        print(f"    {'PASS' if ok else 'FAIL'}  held {held:>2}  (peak {peak:.3f})  {text!r}")
+
+    rng = np.random.default_rng(0)
+    burst = np.concatenate([
+        np.zeros(8000), rng.normal(0, 9000, 4000).clip(-32000, 32000), np.zeros(16000),
+    ]).astype(np.int16)
+    peak, held = score(burst)
+    best_negative = max(best_negative, held)
+    ok = held < wake_frames
+    failed += not ok
+    print(f"    {'PASS' if ok else 'FAIL'}  held {held:>2}  (peak {peak:.3f})  a 250ms burst, standing in for a cough")
+
+    peak, held = score(np.zeros(16000 * 3, dtype=np.int16))
+    ok = held < wake_frames
+    failed += not ok
+    print(f"    {'PASS' if ok else 'FAIL'}  held {held:>2}  (peak {peak:.3f})  three seconds of silence")
+
+    tmp.unlink(missing_ok=True)
+
+    # The margin is the real result. Passing with the best negative at 0.49 is
+    # not the same as passing with it at 0.05, and only one of those survives a
+    # different microphone or a noisier room.
+    margin = worst_positive - best_negative
+    print(f"\n  held frames: worst positive {worst_positive}   best negative {best_negative}"
+          f"   margin {margin}   (waking needs {wake_frames})")
+    if not failed and margin < 2:
+        print("  WARNING: thin margin; a noisier room or another mic could flip it")
+    print("\n" + ("all pass" if not failed else f"{failed} FAILED"))
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

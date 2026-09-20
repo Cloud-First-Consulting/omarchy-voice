@@ -1,0 +1,11 @@
+#!/bin/bash
+# Start/stop the wake word listener. Worth a keybinding while the only working
+# microphone is a Bluetooth headset: listening pins it to HFP, so music sounds
+# like a phone call until you stop it.
+if systemctl --user is-active --quiet omarchy-voice-wake; then
+  systemctl --user stop omarchy-voice-wake
+  omarchy-notification-send -g 󰍭 "Wake word off" "AirPods back to full audio quality" -t 4000
+else
+  systemctl --user start omarchy-voice-wake
+  omarchy-notification-send -g 󰍬 "Wake word on" "Say “Hey Marvin” followed by a command" -t 4000
+fi

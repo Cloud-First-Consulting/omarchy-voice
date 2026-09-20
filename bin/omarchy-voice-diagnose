@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+
+# omarchy:summary=Diagnose a problem on this machine by gathering evidence first
+# omarchy:args=<complaint> [--fix] [--text]
+# omarchy:examples=omarchy-voice-diagnose "my bluetooth keeps disconnecting"
+
+"""Work out what is actually wrong, rather than what usually is.
+
+omarchy-voice-help answers "how do I", from the command reference. This answers
+"why isn't this working", and the difference is that it looks before it speaks:
+it picks a handful of read-only probes, runs them, and reasons from what they
+actually said about this machine. Asked about Bluetooth without looking, any
+model will produce the same plausible paragraph about pairing and restarting
+the service whether or not the adapter is even switched on.
+
+The probes are a fixed table and the model chooses among them **by name**. It
+never composes a command to run, so the evidence-gathering stage has no
+injection surface at all and is read-only by construction rather than by
+inspection. Only the repair stage can propose something that changes the
+machine, and that goes through the same allowlist as everything else and is
+never run without --fix.
+
+    omarchy-voice-diagnose "my bluetooth keeps disconnecting"
+    omarchy-voice-diagnose "there is no sound" --text
+    omarchy-voice-diagnose "wifi keeps dropping" --fix
+"""
+
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+
+# resolve() follows the symlink from ~/.local/bin back into the repo, so the
+# shared module is found however this was invoked.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib"))
+from omarchy_voice_ui import Progress  # noqa: E402
+import omarchy_voice_agent as agent  # noqa: E402
+
+MODEL = os.environ.get("OMARCHY_VOICE_MODEL", "haiku")
+TIMEOUT = int(os.environ.get("OMARCHY_VOICE_TIMEOUT", "90"))
+REPORT = pathlib.Path.home() / ".local/share/omarchy/last-diagnosis.md"
+
+# Every probe is read-only, fixed, and referred to by name. Adding one here is
+# the only way to widen what a diagnosis can see.
+PROBES = {
+    # whole machine
+    "failed-user-services": ["systemctl", "--user", "--failed", "--no-legend"],
+    "failed-system-services": ["systemctl", "--failed", "--no-legend"],
+    "recent-errors": ["journalctl", "-p", "err", "-b", "--no-pager", "-n", "25"],
+    "disk-space": ["df", "-h", "/"],
+    "memory": ["free", "-h"],
+    "uptime": ["uptime"],
+    "omarchy-version": ["omarchy", "version"],
+
+    # sound
+    "audio-overview": ["wpctl", "status"],
+    "audio-sinks": ["pactl", "list", "short", "sinks"],
+    "audio-sources": ["pactl", "list", "short", "sources"],
+    "audio-default": ["pactl", "info"],
+    "audio-cards": ["pactl", "list", "short", "cards"],
+    "pipewire-service": ["systemctl", "--user", "is-active", "pipewire"],
+    "pipewire-log": ["journalctl", "--user", "-u", "pipewire", "-b", "--no-pager", "-n", "20"],
+
+    # bluetooth
+    "bluetooth-power": ["bluetoothctl", "show"],
+    "bluetooth-devices": ["bluetoothctl", "devices"],
+    "bluetooth-service": ["systemctl", "is-active", "bluetooth"],
+    "bluetooth-log": ["journalctl", "-u", "bluetooth", "-b", "--no-pager", "-n", "25"],
+
+    # is it even switched on and up - the questions that settled the real
+    # wifi fault on this machine, after a plausible theory about Bluetooth
+    # coexistence turned out to be wrong
+    "link-state": ["ip", "-brief", "link"],
+    "rfkill": ["rfkill", "list"],
+    "wifi-link": ["iw", "dev"],
+    "saved-connections": ["nmcli", "-t", "-f", "NAME,TYPE,AUTOCONNECT", "connection", "show"],
+
+    # hardware and the firmware bound to it
+    "pci-devices": ["lspci", "-nnk"],
+    "kernel-firmware": ["journalctl", "-k", "-b", "--no-pager", "-g",
+                        "loaded firmware|Detected|firmware version", "-n", "20"],
+    "kernel-asserts": ["journalctl", "-k", "-b", "--no-pager", "-g",
+                       "SYSASSERT|Microcode SW error|HW error|Hardware error", "-n", "20"],
+    "pci-bus-errors": ["journalctl", "-k", "-b", "--no-pager", "-g",
+                       "AER|PCIe Bus Error|link training", "-n", "15"],
+    "kernel-version": ["uname", "-a"],
+
+    # network
+    "network-status": ["nmcli", "general", "status"],
+    "network-devices": ["nmcli", "device", "status"],
+    "network-connections": ["nmcli", "-t", "-f", "NAME,TYPE,DEVICE", "connection", "show", "--active"],
+    "ip-addresses": ["ip", "-brief", "addr"],
+    "dns": ["resolvectl", "status"],
+    "wifi-errors": ["journalctl", "-b", "--no-pager", "-g", "iwlwifi|wpa_supplicant|NetworkManager", "-p", "warning", "-n", "25"],
+
+    # display and compositor
+    "monitors": ["hyprctl", "monitors"],
+    "hyprland-version": ["hyprctl", "version"],
+    "open-windows": ["hyprctl", "clients"],
+    "hyprland-log": ["journalctl", "--user", "-b", "--no-pager", "-g", "hyprland", "-n", "20"],
+
+    # power
+    "battery": ["omarchy", "battery", "status"],
+    "power-profile": ["powerprofilesctl", "get"],
+
+    # the assistant itself
+    "voice-service": ["systemctl", "--user", "status", "omarchy-voice-wake", "--no-pager"],
+    "voice-log": ["journalctl", "--user", "-u", "omarchy-voice-wake", "-b", "--no-pager", "-n", "30"],
+}
+
+PROBE_BUDGET = 6      # more than this and the second prompt drowns in evidence
+PROBE_OUTPUT = 2200   # characters kept per probe
+
+# The repair stage may only propose these, and never runs them without --fix.
+ALLOWED = ("omarchy", "systemctl", "hyprctl", "pactl", "wpctl", "bluetoothctl", "nmcli")
+FORBIDDEN = re.compile(
+    r"\b(shutdown|reboot|poweroff|halt|logout|mkfs|fdisk|luks|dd|rm|delete|forget)\b", re.I)
+
+PICK_PROMPT = """\
+Something is wrong on an Omarchy Linux machine (Arch, Hyprland, PipeWire) and
+you are choosing what to look at before saying anything about it.
+
+The complaint: {complaint}
+
+Probes available, all read-only:
+{probes}
+
+Choose at most {budget}, the ones whose output would actually distinguish
+between the likely causes. Include a general one such as recent-errors or a
+failed-services probe when the complaint is vague.
+
+Always include the mundane checks before the interesting ones. Whether a thing
+is switched on, up, and connected settles more complaints than any theory
+about interference or drivers, and it is the check most easily skipped. For
+anything about a network interface that means link-state and rfkill; for
+anything about a device, whether the driver is even bound to it.
+
+Reply with ONE JSON object and nothing else:
+  {{"probes": ["name", "..."]}}\
+"""
+
+DIAGNOSE_PROMPT = """\
+You are diagnosing a problem on an Omarchy Linux machine (Arch, Hyprland,
+PipeWire). Below is the complaint and the actual output of read-only probes
+run on this machine seconds ago. Reason from that evidence. Where it does not
+support a conclusion, say what is still unknown instead of guessing.
+
+The complaint: {complaint}
+
+Evidence:
+{evidence}
+
+Reply with ONE JSON object and nothing else. No markdown fence.
+
+  {{"say": "<one or two sentences, read aloud: what is wrong>",
+    "cause": "<what the evidence indicates, one sentence>",
+    "steps": ["<what to do, in order>"],
+    "commands": [["prog","arg"], ...],
+    "confidence": "high|low"}}
+
+  say         Spoken. Lead with the finding. No preamble.
+  cause       What the evidence actually shows. If it shows nothing relevant,
+              say that plainly - "nothing in the logs points at this" is a
+              legitimate and useful answer.
+  commands    Only what can be run unattended, and only from these programs:
+              omarchy, systemctl, hyprctl, pactl, wpctl, bluetoothctl, nmcli.
+              Anything needing sudo, a package manager, or a kernel module
+              belongs in "steps" as an instruction to the user and must not
+              appear here - those are still the right advice, they are simply
+              not this program's to run. Empty is fine, and better than a
+              guess. Never destructive, never unpairing or deleting, never a
+              reboot.
+  confidence  "low" when the evidence does not really settle it.
+
+Quote exact values from the evidence - device names, service names, error
+strings - rather than describing them in general terms.
+
+Rule out the boring explanation first, out loud. If an interface is DOWN, that
+is the finding, whatever else is in the logs; do not reach past it for
+something more interesting. A plausible story about radio interference is worse
+than useless when the real answer is that the interface never came up, because
+it sends someone to change BIOS settings over a problem that was never there.
+
+Distinguish hardware from software explicitly when asked. Firmware asserting
+("Microcode SW error", "SYSASSERT") is software: the device is present and its
+firmware crashed. Hardware means the device vanishing from the bus, PCIe/AER
+errors, or firmware that will not load at all. Say which one the evidence shows
+and which signs are absent.
+
+Voice: dry, understated, competent. State the finding and stop. No filler. It
+is read by a speech engine, so words rather than symbols and no markdown.\
+"""
+
+
+def notify(title, body, icon="󰀦", timeout=10000):
+    try:
+        subprocess.run(["omarchy-notification-send", "-g", icon, title, body,
+                        "-t", str(timeout)], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
+def speak(text):
+    if text.strip():
+        try:
+            subprocess.run(["omarchy-voice-say", text], check=False, timeout=60,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
+def model(prompt):
+    result, error = agent.ask(prompt, model=MODEL, timeout=TIMEOUT)
+    if error:
+        return None
+    result = re.sub(r"^```(?:json)?|```$", "", result.strip(), flags=re.M).strip()
+    match = re.search(r"\{.*\}", result, re.S)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+
+
+def choose(complaint):
+    catalogue = "\n".join(f"  {name}" for name in sorted(PROBES))
+    picked = model(PICK_PROMPT.format(complaint=complaint, probes=catalogue,
+                                      budget=PROBE_BUDGET))
+    names = [n for n in ((picked or {}).get("probes") or []) if n in PROBES]
+    if not names:
+        # A diagnosis with no evidence is just an opinion; fall back to the
+        # probes that are informative about almost anything.
+        names = ["recent-errors", "failed-user-services", "failed-system-services"]
+    return names[:PROBE_BUDGET]
+
+
+def run_probe(name):
+    try:
+        proc = subprocess.run(PROBES[name], capture_output=True, text=True, timeout=25)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"(probe failed: {exc})"
+    out = (proc.stdout or proc.stderr or "").strip()
+    return out[:PROBE_OUTPUT] or "(no output)"
+
+
+def vet(argv):
+    if not argv or not all(isinstance(a, str) for a in argv):
+        return "malformed"
+    if argv[0] not in ALLOWED:
+        return f"{argv[0]} is not a command this will run"
+    if FORBIDDEN.search(" ".join(argv)):
+        return "does something that should be done by hand"
+    return None
+
+
+def main():
+    flags = {a for a in sys.argv[1:] if a.startswith("--")}
+    complaint = " ".join(a for a in sys.argv[1:] if not a.startswith("--")).strip()
+    if not complaint:
+        sys.exit('usage: omarchy-voice-diagnose "<what is wrong>" [--fix] [--text]')
+
+    progress = Progress("Diagnosing", enabled="--text" not in flags).start()
+
+    progress.stage("working out what to look at")
+    names = choose(complaint)
+    print(f"  looked at: {', '.join(names)}\n", file=sys.stderr)
+
+    # Named individually rather than as "gathering evidence": on a machine that
+    # is misbehaving, knowing it is four probes in and currently reading the
+    # journal is the difference between waiting and giving up.
+    collected = []
+    for index, name in enumerate(names, 1):
+        progress.stage(f"{name.replace('-', ' ')}  ({index} of {len(names)})")
+        collected.append(f"$ {' '.join(PROBES[name])}\n{run_probe(name)}")
+    evidence = "\n\n".join(collected)
+
+    progress.stage("working it out")
+    answer = model(DIAGNOSE_PROMPT.format(complaint=complaint, evidence=evidence))
+    if answer is None:
+        progress.finish("󰀦", "Diagnosing", "the model did not come back")
+        notify("Couldn't diagnose that", "the model did not come back", "󰀦")
+        return 1
+
+    say = str(answer.get("say", "")).strip()
+    cause = str(answer.get("cause", "")).strip()
+    steps = [str(s) for s in (answer.get("steps") or [])]
+    commands = [c for c in (answer.get("commands") or []) if isinstance(c, list)]
+    low = str(answer.get("confidence", "")).lower() == "low"
+
+    print(say)
+    if cause:
+        print(f"\n  evidence: {cause}")
+    for i, step in enumerate(steps, 1):
+        print(f"  {i}. {step}")
+    if commands:
+        print("\n  suggested:")
+        for argv in commands:
+            reason = vet(argv)
+            print(f"    {'(refused: ' + reason + ') ' if reason else ''}{' '.join(argv)}")
+        if "--fix" not in flags:
+            print("\n  nothing was run. add --fix to apply these.")
+    if low:
+        print("\n  (the evidence does not really settle this)")
+
+    try:
+        REPORT.parent.mkdir(parents=True, exist_ok=True)
+        body = [f"# {complaint}", "", say, "", f"**Evidence:** {cause}", ""]
+        body += [f"{i}. {s}" for i, s in enumerate(steps, 1)]
+        if commands:
+            body += ["", "```"] + [" ".join(c) for c in commands] + ["```"]
+        body += ["", "---", "", "## Probe output", "", "```", evidence, "```"]
+        REPORT.write_text("\n".join(body) + "\n")
+    except OSError:
+        pass
+
+    # The result replaces the spinner, so the thing you were watching turns
+    # into the answer rather than a second notification arriving beside it.
+    if not progress.finish("󰄬" if not low else "󰀦", "Diagnosis", say[:200]):
+        notify("Diagnosis" if not low else "Diagnosis (unsure)", say[:200], "󰋗")
+    if "--text" not in flags:
+        speak(say)
+
+    if "--fix" in flags and commands:
+        for argv in commands:
+            reason = vet(argv)
+            if reason:
+                print(f"  refused {' '.join(argv)}: {reason}", file=sys.stderr)
+                return 1
+        for argv in commands:
+            print(f"  running {' '.join(argv)}")
+            subprocess.run(argv, check=False)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

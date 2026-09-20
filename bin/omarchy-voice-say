@@ -1,0 +1,98 @@
+#!/bin/bash
+
+# omarchy:summary=Speak a line in the assistant's voice, with the wake listener muted
+# omarchy:args=<text> | --test
+# omarchy:examples=omarchy-voice-say "Fourteen degrees and raining."
+
+# Neural text to speech, local, via piper.
+#
+# Two things make this more than a one-liner.
+#
+# The mute. The microphone and the speaker are frequently the same Bluetooth
+# headset, so anything said here goes straight back into the listener waiting
+# for a wake word. Left alone it hears itself and records its own sentence as
+# your next command. A flag file goes up for the duration and the listener drops
+# everything it reads while it is there. The flag carries a deadline rather than
+# merely existing: if this script is killed between raising and lowering it, a
+# plain flag would leave the listener deaf indefinitely.
+#
+# The streaming. piper is asked for raw audio on stdout rather than a finished
+# file, and that is piped straight into playback, so speech begins while the
+# rest of the sentence is still being synthesised. Waiting for the whole file
+# first cost about three quarters of a second of silence before every reply -
+# on a two word answer, longer than the answer.
+
+set -uo pipefail
+
+PIPER_DIR="$HOME/.local/share/piper"
+CONFIG="$HOME/.config/omarchy/voice-wake.json"
+RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/omarchy-voice"
+FLAG="$RUN_DIR/speaking"
+
+# Echo does not stop when the samples do: the headset has latency and the room
+# has reverb. A short tail keeps the last syllable out of the next command.
+TAIL_SECS=0.25
+
+text="${*:-}"
+[[ ${1:-} == --test ]] && text="Good evening. Systems are nominal, more or less."
+[[ -z ${text// /} ]] && { echo "usage: omarchy-voice-say <text>" >&2; exit 1; }
+
+# One interpreter start for every setting, rather than one per setting. Also
+# reads the model's own sample rate, which raw output does not carry.
+read -r enabled voice speed rate < <(python3 - "$CONFIG" "$PIPER_DIR" <<'PY'
+import json, pathlib, sys
+cfg_path, piper_dir = sys.argv[1], sys.argv[2]
+try:
+    cfg = json.loads(pathlib.Path(cfg_path).read_text())
+except Exception:
+    cfg = {}
+voice = cfg.get("voice") or "en_GB-alan-medium"
+try:
+    speed = float(cfg.get("voice_speed") or 1.0)
+    if not 0.5 <= speed <= 2.0:
+        speed = 1.0
+except (TypeError, ValueError):
+    speed = 1.0
+rate = 22050
+try:
+    meta = json.loads((pathlib.Path(piper_dir) / "voices" / f"{voice}.onnx.json").read_text())
+    rate = int(meta["audio"]["sample_rate"])
+except Exception:
+    pass
+# piper measures pace as length_scale, where bigger is slower - the opposite of
+# how anyone thinks about it, so the config takes speed and it is inverted here.
+print("yes" if cfg.get("speak", True) else "no", voice, f"{1/speed:.3f}", rate)
+PY
+)
+
+[[ $enabled == "yes" ]] || exit 0
+
+model="$PIPER_DIR/voices/$voice.onnx"
+if [[ ! -x $PIPER_DIR/piper || ! -f $model ]]; then
+  echo "omarchy-voice-say: no piper voice at $model" >&2
+  exit 1
+fi
+
+# Strip what reads badly aloud: notification glyphs, and the markdown a model
+# reaches for even when told to write one plain sentence.
+spoken=$(printf '%s' "$text" | sed -E 's/[`*_#|]//g; s/[󰀦󰄬󰍬󰍭󰚩󰅧󰜺󰋗]//g; s/  +/ /g')
+
+mkdir -p "$RUN_DIR"
+# shellcheck disable=SC2064
+trap "rm -f '$FLAG'" EXIT
+
+# Nothing knows the length until synthesis finishes, and with streaming that is
+# only true once it has already been said. This is a crash guard, not a timer:
+# the flag is removed explicitly below, and generous is safer than tight.
+deadline=$(awk -v n="${#spoken}" 'BEGIN { printf "%.3f", systime() + n/9 + 4 }')
+printf '%s\n' "$deadline" >"$FLAG"
+
+printf '%s' "$spoken" |
+  LD_LIBRARY_PATH="$PIPER_DIR" "$PIPER_DIR/piper" \
+    --model "$model" --length_scale "$speed" --output_raw 2>/dev/null |
+  pw-play --rate="$rate" --channels=1 --format=s16 --raw - >/dev/null 2>&1
+status=${PIPESTATUS[2]}
+
+sleep "$TAIL_SECS"
+rm -f "$FLAG"
+exit "$status"

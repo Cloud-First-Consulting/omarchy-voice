@@ -1,0 +1,520 @@
+#!/bin/bash
+
+# Speak an action, the system does it.
+#
+# Push-to-talk sibling of voxtype dictation: voxtype types what you said at the
+# cursor, this runs what you said. Recording is ours rather than the voxtype
+# daemon's, so dictation and voice control never fight over one daemon's state.
+#
+#   omarchy-voice-command start|stop|toggle|cancel|last
+#   omarchy-voice-command text "zoom in"   # dispatch a typed phrase, for testing
+#   omarchy-voice-command file speech.wav  # transcribe a WAV and dispatch it
+#
+# Anything the table does not cover goes to omarchy-voice-plan, which asks a
+# model which tool to use and with which arguments, and vets the answer against
+# an allowlist before running it. "ask claude to ..." still opens a full agent
+# session for work that needs one.
+
+set -uo pipefail
+
+RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/omarchy-voice"
+WAV="$RUN_DIR/command.wav"
+PID_FILE="$RUN_DIR/record.pid"
+LAST="$RUN_DIR/last.txt"
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/voice-wake.json"
+
+# The assistant's name is read from the config, never written down here.
+#
+# It used to be spelled out in two regexes in this file, which quietly made the
+# documented "renaming is a one-line config change" false: rename it and the
+# wake word would still be stripped correctly by the listener while this file
+# went on looking for the old one, so every command kept a dead name on the
+# front of it and stopped matching the phrase table.
+#
+# wake_aliases is the other half. Whisper does not reliably hand back the name
+# - the journal has held manglings as far from it as "The job is", "of this"
+# and "hours" - so whatever a given name is commonly misheard as belongs in the
+# config beside it, and is treated exactly as the name is. Populate it from
+# your own journal; the shipped values are a starting point, not a measurement.
+name_parts() {
+  local first="hey marvin" aliases=""
+  if command -v jq >/dev/null 2>&1 && [[ -r $CONFIG_FILE ]]; then
+    first=$(jq -r '(.wake_words[0] // "hey marvin")' "$CONFIG_FILE" 2>/dev/null) || first="hey marvin"
+    aliases=$(jq -r '(.wake_aliases // []) | join(" ")' "$CONFIG_FILE" 2>/dev/null) || aliases=""
+  fi
+  # Letters and spaces only. These end up inside a regex, and a name is a word.
+  printf '%s %s' "${first##* }" "$aliases" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z \n'
+}
+
+# "marvin martin" -> "marvin|martin", for use as a regex alternation.
+NAME_WORDS=$(name_parts)
+NAME_RE=$(echo "$NAME_WORDS" | tr -s ' ' '\n' | grep -v '^$' | awk '!seen[$0]++' | paste -sd'|' -)
+[[ -n $NAME_RE ]] || NAME_RE="marvin"
+# What to call it in a notification: the first word, capitalised.
+AGENT_NAME=$(echo "${NAME_WORDS%% *}" | sed -E 's/^(.)/\U\1/')
+[[ -n $AGENT_NAME ]] || AGENT_NAME="Marvin"
+
+# The coding agent is a different thing from the name above: that is what this
+# assistant is called, this is what it hands work off to.
+#
+# Every agent Omarchy can launch, plus the manglings of "claude" the journal
+# actually holds. Which one starts is Omarchy's decision rather than ours -
+# `omarchy agent` reads the user's default and knows each one's flags - so all
+# this list has to do is recognise that an agent is what was meant. Longer
+# forms first, so "claude code" is not matched as "claude" with a stray word.
+CODING_AGENT_WORDS='claude code|cloud code|coding agent|cursor agent|open code|oh my pi|the agent|opencode|openclaw|copilot|hermes|gemini|cursor|claude|clawed|codex|crush|cloud|grok|muse|clod|omp|agent|pi'
+
+# What to call it in a notification. Whatever Omarchy is set to launch, rather
+# than the one agent this happened to be written against.
+coding_agent_label() {
+  local a
+  a=$(omarchy-default-agent 2>/dev/null) || a=""
+  [[ -n $a ]] || { echo "Agent"; return; }
+  echo "$a" | sed -E 's/^(.)/\U\1/'
+}
+
+# The planner and the manual need an agent that can answer one question without
+# a terminal. Which agents can is omarchy_voice_agent.py's business; here it is
+# enough that something is configured, or that claude is installed to fall back
+# on.
+have_coding_agent() {
+  command -v claude >/dev/null 2>&1 || [[ -n $(omarchy-default-agent 2>/dev/null) ]]
+}
+
+notify() { omarchy-notification-send -g "${3:-󰍬}" "$1" "$2" -t "${4:-4000}" >/dev/null 2>&1 || true; }
+
+recording_pid() {
+  [[ -f $PID_FILE ]] || return 1
+  local pid
+  read -r pid <"$PID_FILE" 2>/dev/null || return 1
+  [[ -n ${pid:-} ]] && kill -0 "$pid" 2>/dev/null && echo "$pid"
+}
+
+start() {
+  mkdir -p "$RUN_DIR"
+  recording_pid >/dev/null && return 0
+
+  # 16 kHz mono is what whisper wants; anything else just costs a resample.
+  # Default source, so it follows whatever the audio panel is pointed at —
+  # WirePlumber flips a Bluetooth headset to HFP for the duration on its own.
+  pw-record --rate=16000 --channels=1 --format=s16 "$WAV" >/dev/null 2>&1 &
+  echo $! >"$PID_FILE"
+  notify "Listening" "Speak a command" 󰍬 30000
+}
+
+stop() {
+  local pid
+  pid=$(recording_pid) || { rm -f "$PID_FILE"; exit 0; }
+
+  # SIGINT rather than SIGTERM: pw-record finalizes the WAV header on interrupt.
+  kill -INT "$pid" 2>/dev/null
+  for _ in {1..40}; do kill -0 "$pid" 2>/dev/null || break; sleep 0.05; done
+  rm -f "$PID_FILE"
+
+  # Under ~0.3s of audio is a fumbled keypress, not a command.
+  if [[ ! -s $WAV ]] || (( $(stat -c %s "$WAV" 2>/dev/null || echo 0) < 10000 )); then
+    notify "Nothing heard" "Hold the key while speaking" 󰍭
+    exit 0
+  fi
+
+  transcribe_and_dispatch "$WAV"
+}
+
+transcribe_and_dispatch() {
+  local wav=$1 text
+  text=$(voxtype transcribe "$wav" 2>/dev/null | tail -1)
+  text=$(echo "$text" | tr -d '\r' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')
+
+  if [[ -z $text ]]; then
+    notify "Nothing heard" "No speech in that recording" 󰍭
+    exit 0
+  fi
+
+  printf '%s\n' "$text" >"$LAST"
+  dispatch "$text"
+}
+
+# Lowercased, stripped of the punctuation whisper adds and of the filler that
+# separates "launch a browser" from "launch browser". Speech is not a CLI: the
+# same intent arrives worded a dozen ways, and the table should not care.
+#
+# The politeness prefixes earn their place here. "can you open the browser" and
+# "open the browser" are one request, but only the second used to reach the
+# table - so every polite phrasing paid a model round trip to be told what a
+# string comparison already knew. Most of what fell through to the planner was
+# this, not genuinely novel requests.
+normalize() {
+  echo "$1" |
+    tr '[:upper:]' '[:lower:]' |
+    sed -E "
+      s/[.,!?;:\"]//g
+      s/^[[:space:]]+|[[:space:]]+\$//g
+      s/^(hey +|ok +|okay +)?(${NAME_RE})( +|\$)//g
+      s/^(can|could|would|will) +(you|u) +(please +)?//g
+      s/^(i +(want|need|would like) +(you +)?to|let us|lets|let's|help me) +//g
+      s/^(please|okay|ok|now|so|um|uh|just) +//g
+      s/ +(please|for me|now|thanks|thank you)\$//g
+      s/\b(open|launch|start|bring|pull) up\b/\1/g
+      s/\b(a|an|the|my|some|up) +(browser|terminal|window|screen|file manager|files|volume|background|wallpaper|screenshot|theme|workspace)\b/\2/g
+      s/\b(a|an|the) +//g
+      s/^(switch|change|go|move|jump) +(to +)?workspace\b/workspace/g
+      s/^workspace +(to +)?(number +)?/workspace /g
+      s/ +(app|application)\$//g
+      s/[[:space:]]+/ /g
+      s/^[[:space:]]+|[[:space:]]+\$//g
+    "
+}
+
+# Words a command plausibly begins with. Used only to find where the command
+# starts, never to interpret it.
+COMMAND_WORDS="open|close|launch|start|run|show|go|switch|change|move|jump|tell|play|set|turn|take|navigate|lock|unlock|mute|unmute|volume|next|previous|screenshot|fullscreen|stop|pause|resume|what|what's|whats|who|how|when|where|why"
+
+# Drop a mis-transcribed wake word from the front of a command.
+#
+# The recording deliberately begins slightly before the wake word, so that a
+# command spoken straight after it is not clipped. The cost is that whisper
+# transcribes the wake word too, and reliably mangles it: the journal has held
+# manglings as far from the name as "The job is", "of this" and "hours", each
+# of which then rides along as part of the command and stops it matching.
+#
+# The rule is narrow on purpose. Nothing is dropped when the phrase already
+# begins with a command word, so real commands are never touched, and it only
+# looks three words in - beyond that it would be rewriting the request rather
+# than trimming noise in front of it.
+strip_wake_debris() {
+  local phrase=$1 first word index
+  first=${phrase%% *}
+  [[ $first =~ ^($COMMAND_WORDS)$ ]] && { printf '%s' "$phrase"; return; }
+  local -a words
+  read -ra words <<<"$phrase"
+  for index in 1 2 3; do
+    word=${words[$index]:-}
+    [[ -z $word ]] && break
+    if [[ $word =~ ^($COMMAND_WORDS)$ ]]; then
+      printf '%s' "${words[*]:$index}"
+      return
+    fi
+  done
+  printf '%s' "$phrase"
+}
+
+word_to_digit() {
+  case "$1" in
+    one) echo 1 ;; two) echo 2 ;; three) echo 3 ;; four) echo 4 ;; five) echo 5 ;;
+    six) echo 6 ;; seven) echo 7 ;; eight) echo 8 ;; nine) echo 9 ;; ten) echo 10 ;;
+    *) echo "$1" ;;
+  esac
+}
+
+# Browser-style zoom ladder, the same one bound to SUPER+CTRL+Z.
+zoom_step() {
+  local direction=$1 current levels=(1 1.1 1.25 1.5 1.75 2 2.5 3 4 5) index=1 best=999 i d
+  current=$(hyprctl getoption cursor:zoom_factor -j 2>/dev/null | sed -E 's/.*"float": *([0-9.]+).*/\1/')
+  current=${current:-1}
+  for i in "${!levels[@]}"; do
+    d=$(awk -v a="${levels[$i]}" -v b="$current" 'BEGIN{d=a-b; print (d<0?-d:d)}')
+    if awk -v d="$d" -v best="$best" 'BEGIN{exit !(d<best)}'; then best=$d; index=$i; fi
+  done
+  local next=$((index + direction))
+  ((next < 0)) && next=0
+  ((next >= ${#levels[@]})) && next=$((${#levels[@]} - 1))
+  # The Lua parser rejects `hyprctl keyword`; eval is the supported path.
+  hyprctl eval "hl.config({ cursor = { zoom_factor = ${levels[$next]} } })" >/dev/null
+  echo "${levels[$next]}x"
+}
+
+ran() { notify "$1" "“$2”" 󰄬; }
+
+# Anything that opens a window and then stays open must not be waited on. The
+# wake listener runs this script as a subprocess, so a terminal left in the
+# foreground here pins the whole chain - this script, and the listener above it -
+# to the lifetime of that window, and the microphone goes unread until you close
+# it. setsid --fork returns as soon as the grandchild is on its own.
+detach() { setsid --fork "$@" >/dev/null 2>&1 & }
+
+# A cloud session runs on Anthropic's infrastructure rather than this machine,
+# so it keeps working after the laptop sleeps — but it needs a repo to work in.
+#
+# This one really is Claude-specific, unlike the handoff above: --cloud is a
+# Claude Code feature and no other agent has an equivalent to route to. Saying
+# so is better than quietly starting Claude for someone whose agent is Codex,
+# which is what naming an agent in the sentence used to do.
+to_cloud() {
+  local task=$1
+  if ! command -v claude >/dev/null 2>&1; then
+    notify "No cloud agent" "Cloud sessions need Claude Code installed" 󰀦 6000
+    return
+  fi
+  if [[ ${OMARCHY_VOICE_DRY:-} == 1 ]]; then
+    echo "would launch: claude --cloud \"$task\""
+    return
+  fi
+  notify "Starting a cloud agent" "“$task”" 󰅧 8000
+  detach omarchy-launch-tui --app-id=org.omarchy.agent claude --cloud "$task"
+}
+
+to_agent() {
+  local prompt=$1
+  if [[ ${OMARCHY_VOICE_DRY:-} == 1 ]]; then
+    echo "would launch: omarchy agent prompt \"$prompt\""
+    return
+  fi
+  if [[ -z $(omarchy-default-agent 2>/dev/null) ]]; then
+    notify "No agent set" "Choose one with: omarchy default agent" 󰀦
+    return
+  fi
+  notify "Asking the agent" "“$prompt”" 󰚩 6000
+  detach omarchy agent prompt "$prompt"
+}
+
+# A complaint is not a question. "How do I change the theme" wants the manual;
+# "the theme menu won't open" wants someone to go and look at this machine.
+# omarchy-voice-diagnose runs read-only probes and reasons from what they say,
+# which is the difference between a diagnosis and a plausible paragraph.
+OMARCHY_COMPLAINT='(not working|isn.?t working|won.?t( [a-z]+){0,2} (work|open|connect|start|launch|play|load|respond|boot)|doesn.?t( [a-z]+){0,2} (work|open|connect|start|respond)|stopped working|keeps (dropping|disconnecting|crashing|freezing|failing)|is broken|no (sound|audio|wifi|internet|network|display|signal)|cant hear|can.?t hear|nothing happens|not connecting|not detected|too slow|very slow|freezing|crashed|crashing|fix (my|the|this)|whats wrong|what.?s wrong)'
+is_complaint() {
+  [[ $1 =~ $OMARCHY_COMPLAINT ]]
+}
+
+# Questions about Omarchy itself go somewhere that knows about Omarchy.
+#
+# The planner turns a sentence into an action and carries a catalogue of about
+# thirty commands to do it with. That is the wrong tool for "how do I change
+# the theme": there are 356 commands on this machine, and an answer drawn from
+# the model's own recollection would be describing some other version of a
+# fast-moving distribution. omarchy-voice-help answers from a reference
+# generated on this machine instead.
+OMARCHY_QUESTION='(^| )(how (do|can|would) (i|you)|how to|what (is|are|does|do)|why (is|are|does|do|wont|won'"'"'t|isn'"'"'t|doesn'"'"'t|cant|can'"'"'t)|where (is|do|can)|which (command|omarchy)|explain|tell me about|help me (with|fix|understand)|what'"'"'s the (command|way))'
+# A question in that shape which is about the world rather than this machine.
+# "what is the weather" is the awkward one: weather is an Omarchy command group
+# *and* the most ordinary question anyone asks a voice assistant. Said aloud it
+# means "tell me the weather", which the planner answers, not "explain the
+# weather command".
+NOT_THIS_MACHINE='(weather|forecast|how (hot|cold|warm)|what time|time is it|date today|todays date|the news|who (is|was|were|are)|capital of|how (much|many) (is|are)|translate|tell me a joke|recipe|define )'
+
+is_omarchy_question() {
+  local t=$1
+  [[ $t =~ $OMARCHY_QUESTION ]] || return 1
+
+  # Named vocabulary settles it outright: Omarchy's own command groups, written
+  # out by omarchy-voice-reference, plus the everyday words for the things those
+  # groups are called in conversation. Derived rather than written by hand, so
+  # the router and the reference cannot disagree about what Omarchy covers.
+  local topics
+  topics=$(grep -vxE 'weather' "$HOME/.local/share/omarchy/topics.txt" 2>/dev/null | tr '\n' '|')
+  topics=${topics%|}
+  local spoken='omarchy|omachi|wallpaper|waybar|keybinding|shortcut|hotkey|workspace|wifi|wi-fi|volume|mic|microphone|screen|nightlight|night light|desktop|setting|command|window|terminal|app|application|lock|copy|paste|zoom|mute|close|quit|launch|open|switch|resize|monitor|display|font|theme|this (machine|system|computer|os)'
+  [[ $t =~ (${topics:-omarchy}|$spoken) ]] && return 0
+
+  # Nothing named it, so fall back on what the question plainly is not. This
+  # used to be the other way round - a question had to name something known or
+  # it went to the planner - and it sent seven of fifteen ordinary new-user
+  # questions to the wrong place: "how do I lock my computer", "how do I close
+  # a window", "how do I mute the sound" all named nothing in the vocabulary.
+  #
+  # The two mistakes do not cost the same. Sent to the manual, an off-topic
+  # question comes back marked low confidence and says so. Sent to the planner,
+  # a real one comes back as a command to type, with no key to press - which is
+  # the entire thing this path exists to prevent. Someone learning their way
+  # around a desktop asking "how do I ..." is asking about the desktop, so the
+  # manual is the default and the exceptions are named.
+  [[ $t =~ $NOT_THIS_MACHINE ]] && return 1
+  return 0
+}
+
+# Nothing in the table matched, so work out the intent with a model: it picks
+# the tool and the arguments, and its plan is vetted before anything runs.
+# Falls back to reporting the phrase if the planner itself is unavailable.
+unrecognized() {
+  local raw=$1 normalized=${2:-}
+  # Complaints first: "why won't bluetooth connect" is both a question and a
+  # complaint, and the useful answer is the one that looked at the machine.
+  if is_complaint "$normalized" && command -v omarchy-voice-diagnose >/dev/null; then
+    detach omarchy-voice-diagnose "$raw"
+    return
+  fi
+  if is_omarchy_question "$normalized" && command -v omarchy-voice-help >/dev/null; then
+    detach omarchy-voice-help "$raw"
+    return
+  fi
+  if command -v omarchy-voice-plan >/dev/null && have_coding_agent; then
+    # The normalized form travels with the sentence so the planner can file what
+    # it works out under the same key the table would have looked up.
+    OMARCHY_VOICE_NORMALIZED="$normalized" omarchy-voice-plan "$raw"
+  elif [[ -n $(omarchy-default-agent 2>/dev/null) ]]; then
+    # --exec takes the command as separate words. Passed as one quoted string
+    # it is rejected outright, which used to mean this branch sent no
+    # notification at all: an unrecognised phrase produced silence rather than
+    # the offer to hand it to the agent.
+    omarchy-notification-send -g 󰀦 "Didn't understand" \
+      "“$raw” — click to ask the agent" -t 8000 \
+      --exec omarchy agent prompt "$raw" >/dev/null 2>&1 || true
+  else
+    notify "Didn't understand" "“$raw”" 󰀦 6000
+  fi
+}
+
+dispatch() {
+  local raw=$1 t
+  t=$(strip_wake_debris "$(normalize "$raw")")
+
+  # Whisper regularly hands back the wake word on its own: vosk wakes on a
+  # partial result, so the tail of the wake phrase lands in the recording that
+  # follows it. That is not a command, and finding that out should not cost a
+  # model round trip.
+  if [[ -z $t ]]; then
+    notify "Yes?" "Say a command after the wake word" 󰍬
+    return
+  fi
+
+  # Whisper hallucinates stock phrases when handed near-silence - the sign-off at
+  # the end of a subtitled video is well represented in its training data, and it
+  # reaches for that when there is nothing to transcribe. "Thank you. I'll see
+  # you in the next video." is the microphone hearing nothing, not a request, and
+  # it should not reach the planner and cost a model call to be told so.
+  local noise_re='^(thank you|thanks|you|bye|bye bye|goodbye|oh|hmm|uh|um|mm|ah|yeah|yep|yes|no|nope|okay|ok|so|well|right|all right|alright)$'
+  noise_re+='|(thanks for watching|thank you for watching|see you in next video|see you next time|please subscribe|subscribe to)'
+  if [[ $t =~ $noise_re ]]; then
+    notify "Nothing heard" "That sounded like silence" 󰍭
+    return
+  fi
+
+  # Checked against the raw sentence, before normalization strips a leading
+  # misheard name: telling it to stop must work whichever side the name falls
+  # on, and must never be mistaken for the "stop" that cancels a recording.
+  local spoken
+  spoken=$(echo "$raw" | tr '[:upper:]' '[:lower:]' | sed -E 's/[.,!?]//g')
+  local stop_re="(stop|sleep|quiet|shut ?up).*(${NAME_RE}|listening)|(${NAME_RE}).*(stop|sleep|be quiet)|^(go to sleep|stop listening|stand down)\$"
+  if [[ $spoken =~ $stop_re ]]; then
+    systemctl --user stop omarchy-voice-wake 2>/dev/null
+    notify "$AGENT_NAME is asleep" "SUPER+ALT+Z to wake, or hold F10" 󰍭 6000
+    return
+  fi
+
+  # Deliberate handoffs, so an agent is only ever started because you said so.
+  # Cloud is checked first: "ask the cloud agent to ..." also matches the local
+  # pattern, and the more specific reading is the one meant.
+  local cloud_re='^(ask|tell|send|have|launch|start|run|spin up) (a |the )?cloud (agent|session)( to| for)? (.+)$'
+  if [[ $spoken =~ $cloud_re ]]; then
+    to_cloud "${BASH_REMATCH[5]}"
+    return
+  fi
+
+  # "... in the cloud" as a suffix, which is how it comes out spoken.
+  local cloud_suffix_re="^(ask|tell) (${CODING_AGENT_WORDS}) to (.+) (in|on) the cloud\$"
+  if [[ $spoken =~ $cloud_suffix_re ]]; then
+    to_cloud "${BASH_REMATCH[3]}"
+    return
+  fi
+
+  local agent_re="^(ask|tell) (${CODING_AGENT_WORDS})( to)? (.+)\$"
+  if [[ $spoken =~ $agent_re ]]; then
+    to_agent "${BASH_REMATCH[4]}"
+    return
+  fi
+
+  case "$t" in
+    cancel|"never mind"|nevermind|stop|"forget it") notify "Cancelled" "“$raw”" 󰜺; return ;;
+
+    # Power actions want the whole phrase. A mishear costs a session otherwise.
+    "shut down computer"|"shutdown computer"|"shut down system") ran "Shutting down" "$raw"; omarchy system shutdown; return ;;
+    "reboot computer"|"restart computer"|"reboot system") ran "Rebooting" "$raw"; omarchy system reboot; return ;;
+
+    lock|"lock screen"|"lock it"|"lock system") ran "Locking" "$raw"; omarchy system lock; return ;;
+  esac
+
+  # Everything below is a pattern rather than a fixed phrase: same intent, many
+  # wordings. Order matters only where one pattern could swallow another.
+  case "$t" in
+    "volume up"|louder|"turn volume up"|"turn it up"|"increase volume") omarchy audio output volume raise; ran "Volume up" "$raw"; return ;;
+    "volume down"|quieter|"turn volume down"|"turn it down"|"decrease volume"|"lower volume") omarchy audio output volume lower; ran "Volume down" "$raw"; return ;;
+    mute|unmute|"mute it"|"toggle mute"|"mute audio"|"mute sound") omarchy audio output volume mute-toggle; ran "Mute toggled" "$raw"; return ;;
+  esac
+
+  local page_re='^(click|press|tap|select) (.+)$|^(type|enter|fill in|put) (.+)$|^(scroll|page) (up|down)( .+)?$|^(close|dismiss) (the )?(dialog|popup|pop up|banner|cookie|modal|overlay|notice)( .*)?$|^go back$'
+  if [[ $t =~ $page_re ]] && command -v omarchy-browser-control >/dev/null; then
+    omarchy-browser-control "$raw"
+    return
+  fi
+
+  local open_re='^(open|launch|start|run|show|go to) (.+)$'
+  if [[ $t =~ $open_re ]]; then
+    local target=${BASH_REMATCH[2]}
+
+    # Any wording built around the agent's name (however it was transcribed)
+    # means the local app, unless the sentence asks for the website.
+    local agent_target_re="(^| )(${CODING_AGENT_WORDS})( |\$)"
+    if [[ $target =~ $agent_target_re && ! $target =~ (\.ai|dot ai|website|web site|in (a|the) browser) ]]; then
+      if [[ ${OMARCHY_VOICE_DRY:-} == 1 ]]; then echo "would launch: omarchy agent"; return; fi
+      detach omarchy agent; ran "$(coding_agent_label)" "$raw"; return
+    fi
+
+    case "$target" in
+      browser|chrome|chromium|firefox|web|internet) omarchy launch browser; ran "Browser" "$raw"; return ;;
+      terminal|console|shell|alacritty|foot) omarchy launch terminal; ran "Terminal" "$raw"; return ;;
+      files|"file manager"|nautilus|explorer|folder) omarchy launch nautilus; ran "Files" "$raw"; return ;;
+      editor|neovim|nvim) omarchy launch editor .; ran "Editor" "$raw"; return ;;
+      claude|"claude code"|cloud|"cloud code"|clawed|clod|code|agent|"coding agent"|\
+      codex|cursor|"cursor agent"|copilot|gemini|opencode|"open code"|crush|grok|\
+      hermes|muse|openclaw|omp|pi)
+        if [[ ${OMARCHY_VOICE_DRY:-} == 1 ]]; then echo "would launch: omarchy agent"; return; fi
+        detach omarchy agent; ran "$(coding_agent_label)" "$raw"; return ;;
+    esac
+    local ws_re='^workspace ([a-z0-9]+)$'
+    if [[ $target =~ $ws_re ]]; then
+      local ws
+      ws=$(word_to_digit "${BASH_REMATCH[1]}")
+      if [[ $ws =~ ^[0-9]+$ ]]; then hyprctl dispatch workspace "$ws" >/dev/null; ran "Workspace $ws" "$raw"; return; fi
+    fi
+  fi
+
+  local bare_ws_re='^workspace ([a-z0-9]+)$'
+  if [[ $t =~ $bare_ws_re ]]; then
+    local ws
+    ws=$(word_to_digit "${BASH_REMATCH[1]}")
+    if [[ $ws =~ ^[0-9]+$ ]]; then hyprctl dispatch workspace "$ws" >/dev/null; ran "Workspace $ws" "$raw"; return; fi
+  fi
+
+  case "$t" in
+    "next background"|"next wallpaper"|"change background"|"change wallpaper"|"new background") omarchy theme bg next; ran "Next background" "$raw"; return ;;
+    "night light"|"toggle night light"|"turn on night light"|"turn off night light") omarchy toggle nightlight; ran "Night light toggled" "$raw"; return ;;
+    "zoom in"|"zoom"|"make it bigger") ran "Zoomed to $(zoom_step 1)" "$raw"; return ;;
+    "zoom out"|"make it smaller") ran "Zoomed to $(zoom_step -1)" "$raw"; return ;;
+    "reset zoom"|"zoom reset"|"normal zoom") hyprctl eval "hl.config({ cursor = { zoom_factor = 1 } })" >/dev/null; ran "Zoom reset" "$raw"; return ;;
+    screenshot|"take screenshot"|"take screen shot"|"capture screen") omarchy capture screenshot; ran "Screenshot" "$raw"; return ;;
+    "close window"|"close this"|"close it"|"close this window") hyprctl dispatch killactive >/dev/null; ran "Closed window" "$raw"; return ;;
+    fullscreen|"full screen"|"make it fullscreen"|"maximize") hyprctl dispatch fullscreen >/dev/null; ran "Fullscreen" "$raw"; return ;;
+    "bluetooth on"|"turn on bluetooth"|"enable bluetooth") omarchy bluetooth power on; ran "Bluetooth on" "$raw"; return ;;
+    "bluetooth off"|"turn off bluetooth"|"disable bluetooth") omarchy bluetooth power off; ran "Bluetooth off" "$raw"; return ;;
+    "wake word off"|"stop listening") systemctl --user stop omarchy-voice-wake; ran "Wake word off" "$raw"; return ;;
+  esac
+
+  local theme_re='^(set |switch to |change to )?theme (.+)$'
+  local theme_to_re='^(set|switch|change) theme to (.+)$'
+  if [[ $t =~ $theme_re ]] || [[ $t =~ $theme_to_re ]]; then
+    local name=${BASH_REMATCH[2]}
+    if omarchy theme set "$name" >/dev/null 2>&1; then
+      ran "Theme: $name" "$raw"
+    else
+      notify "No such theme" "“$name” — try: omarchy theme list" 󰀦
+    fi
+    return
+  fi
+
+  unrecognized "$raw" "$t"
+}
+
+case "${1:-toggle}" in
+  start) start ;;
+  stop) stop ;;
+  toggle) if recording_pid >/dev/null; then stop; else start; fi ;;
+  cancel)
+    pid=$(recording_pid) && kill -INT "$pid" 2>/dev/null
+    rm -f "$PID_FILE" "$WAV"
+    notify "Cancelled" "Recording discarded" 󰜺
+    ;;
+  last) cat "$LAST" 2>/dev/null ;;
+  text) shift; dispatch "$*" ;;
+  file) mkdir -p "$RUN_DIR"; transcribe_and_dispatch "${2:?usage: omarchy-voice-command file <wav>}" ;;
+  *) echo "usage: omarchy-voice-command [start|stop|toggle|cancel|last|text <phrase>|file <wav>]" >&2; exit 1 ;;
+esac

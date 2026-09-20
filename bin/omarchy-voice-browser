@@ -1,0 +1,23 @@
+#!/bin/bash
+
+# A Chromium profile that voice control is allowed to drive.
+#
+# Kept separate from the everyday browser on purpose: enabling the DevTools
+# Protocol means any process on this machine can act as that browser, so it is
+# scoped to a profile with its own cookies and no access to the sessions in the
+# browser you use normally. The port listens on loopback only.
+#
+#   omarchy-voice-browser [url]        start it (or reuse the running one)
+#   omarchy-browser-control "..."      act inside whatever it is showing
+
+PROFILE="$HOME/.local/share/omarchy-voice-browser"
+PORT="${OMARCHY_CDP_PORT:-9222}"
+
+exec /usr/bin/chromium \
+  --user-data-dir="$PROFILE" \
+  --remote-debugging-port="$PORT" \
+  --remote-allow-origins=http://127.0.0.1:"$PORT" \
+  --class=org.omarchy.voicebrowser \
+  --no-first-run \
+  --no-default-browser-check \
+  "$@"

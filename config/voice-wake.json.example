@@ -1,0 +1,29 @@
+{
+  "wake_words": [
+    "hey marvin"
+  ],
+  "wake_aliases": [
+    "martin"
+  ],
+  "mic": "",
+  "silence_ms": 700,
+  "max_command_secs": 12,
+  "min_speech_ms": 300,
+  "silence_level": "auto",
+  "cooldown_secs": 0.4,
+  "stop_words": [
+    "stop marvin",
+    "marvin stop",
+    "go to sleep",
+    "stop listening"
+  ],
+  "sleep_after_minutes": 20,
+  "speak": true,
+  "voice": "en_GB-alan-medium",
+  "voice_speed": 1.12,
+  "wake_model": "hey_marvin_v0.1",
+  "wake_threshold": 0.5,
+  "wake_refractory_secs": 2.0,
+  "followup_secs": 6.0,
+  "wake_frames": 3
+}

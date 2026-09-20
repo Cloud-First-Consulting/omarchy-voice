@@ -1,0 +1,581 @@
+#!/usr/bin/env python3
+"""Always-on wake word for Omarchy voice control.
+
+Listens for "hey marvin", then records the sentence after it and hands the audio
+to omarchy-voice-command, which transcribes it with whisper and runs the
+matching action.
+
+Detection is openWakeWord: a small neural model trained on this one phrase,
+which answers a single question - was that the wake word - with a probability.
+
+That replaced a speech recogniser driven by a one-phrase grammar, and the
+difference is not subtle. A closed grammar has to map *every* sound in the room
+onto one of its phrases, so a cough scored as a flawless wake word and no
+amount of matching could tell the two apart. Four gates were built on top of it
+- the phrase alone, loud enough, stable across reads, long enough to be speech -
+and a cough still got through. Measured on this machine with piper-synthesised
+audio, via omarchy-voice-wake-test:
+
+    "hey marvin"                              1.000
+    "the marvin file is open"                 0.117
+    bare "marvin"                              0.003
+    "marvellous, that worked"                 0.015
+    "job is stopped now"                      0.000
+    a 250ms broadband burst, like a cough     0.000
+
+One threshold at 0.5 now does what those four gates could not, so they are gone.
+
+Those margins are wider than an earlier model measured here, whose nearest
+miss - the name inside an ordinary sentence - peaked at 0.994 against a real
+wake at 0.995 and could only be separated by how long it held. This one
+separates on peak as well, so wake_frames is now belt and braces rather than
+the only thing standing between you and a false wake.
+
+The listener defaults to a built-in microphone rather than the system default:
+an always-open capture stream would pin a Bluetooth headset to the HFP profile
+permanently, which costs you A2DP audio quality all day.
+
+Config: ~/.config/omarchy/voice-wake.json (all keys optional)
+    {"wake_threshold": 0.5, "mic": "", "silence_ms": 1200,
+     "max_command_secs": 12, "min_speech_ms": 300}
+
+The name shown in notifications is taken from the wake words, so renaming the
+assistant is a one-line config change rather than a hunt through the source.
+"""
+
+import array
+import collections
+import json
+import logging
+import os
+import pathlib
+import subprocess
+import sys
+import threading
+import time
+import warnings
+import wave
+
+VENV = pathlib.Path.home() / ".local/share/omarchy-wakeword/venv/bin/python"
+
+# onnxruntime warns once per start that CUDA is unavailable, which on a laptop
+# with no CUDA is noise in the journal rather than news.
+warnings.filterwarnings("ignore", message=".*CUDAExecutionProvider.*")
+
+try:
+    import numpy as np
+    from openwakeword.model import Model
+except ImportError:
+    # The detector needs onnxruntime, which is not installed system-wide - it
+    # lives in its own virtualenv. Re-exec there rather than making the service
+    # file, the keybinding and anyone running this by hand all know that.
+    if VENV.exists() and os.environ.get("OMARCHY_WAKE_REEXEC") != "1":
+        os.environ["OMARCHY_WAKE_REEXEC"] = "1"
+        os.execv(str(VENV), [str(VENV), os.path.abspath(__file__), *sys.argv[1:]])
+    sys.exit(f"openwakeword is missing and no virtualenv at {VENV}")
+
+# How often to look for a configured microphone that was missing at startup.
+# mic_exists shells out to pw-dump, which has no business running every 80ms.
+MIC_RECHECK_SECS = 15
+
+RATE = 16000
+FRAME = 1280  # samples: 80ms, the window openWakeWord expects
+CHUNK = FRAME * 2  # bytes
+CONFIG = pathlib.Path.home() / ".config/omarchy/voice-wake.json"
+WAKE_DIR = pathlib.Path.home() / ".local/share/omarchy-wakeword"
+RUN_DIR = pathlib.Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "omarchy-voice"
+
+DEFAULTS = {
+    "wake_words": ["hey marvin"],  # only the name is read from this now
+    "wake_model": "hey_marvin_v0.1",
+    "wake_threshold": 0.5,  # 0-1; positives score ~0.99, the nearest miss ~0.3
+    "wake_refractory_secs": 2.0,  # ignore a second trigger this soon after one
+    "wake_frames": 3,  # consecutive 80ms frames above threshold before waking
+    "mic": "",
+    "silence_ms": 1200,
+    "max_command_secs": 12,
+    "min_speech_ms": 300,
+    "silence_level": "auto",  # peak below this is silence; "auto" measures the room
+    "cooldown_secs": 1.0,
+    "followup_secs": 6.0,  # after an answer, keep listening this long with no wake word
+}
+
+# What the assistant is called in notifications. Derived from the wake words so
+# it always agrees with what you actually say to it; main() sets it once the
+# config is loaded.
+NAME = "Marvin"
+
+
+def agent_name(config):
+    """The last word of the first wake phrase: "hey marvin" -> "Marvin"."""
+    words = (config.get("wake_words") or ["marvin"])[0].split()
+    return words[-1].capitalize() if words else "Marvin"
+
+
+def load_config():
+    config = dict(DEFAULTS)
+    if CONFIG.exists():
+        try:
+            config.update(json.loads(CONFIG.read_text()))
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"ignoring bad config {CONFIG}: {exc}", file=sys.stderr)
+    return config
+
+
+def notify(title, body, icon="󰍬", timeout=4000):
+    subprocess.run(
+        ["omarchy-notification-send", "-g", icon, title, body, "-t", str(timeout)],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def find_wake_model(name):
+    """The .onnx for this wake word, wherever openwakeword keeps its models."""
+    roots = [WAKE_DIR, pathlib.Path(sys.prefix)]
+    for root in roots:
+        for path in root.rglob(f"{name}.onnx"):
+            return str(path)
+    sys.exit(f"No wake model {name}.onnx found under {WAKE_DIR}")
+
+
+def mic_has_signal(name, seconds=0.4):
+    """A built-in device can exist and capture pure silence; probe before trusting it."""
+    proc = recorder(name)
+    try:
+        data = proc.stdout.read(int(RATE * 2 * seconds))
+    finally:
+        proc.kill()
+    return peak(data or b"") > 50
+
+
+def default_mic():
+    """Built-in capture device that actually hears something, so Bluetooth
+    headsets stay on A2DP and a dead input never silently wins."""
+    try:
+        dump = json.loads(subprocess.run(["pw-dump"], capture_output=True, text=True).stdout)
+    except (json.JSONDecodeError, OSError):
+        return ""
+    builtin = []
+    for obj in dump:
+        props = (obj.get("info") or {}).get("props") or {}
+        if props.get("media.class") == "Audio/Source" and str(props.get("node.name", "")).startswith("alsa_input"):
+            builtin.append((props.get("priority.session", 0), props["node.name"]))
+    # Highest session priority first, but a device that captures silence loses
+    # to one that doesn't — PipeWire's ranking has no idea which jack is wired.
+    for _, name in sorted(builtin, reverse=True):
+        if mic_has_signal(name):
+            return name
+    return max(builtin)[1] if builtin else ""
+
+
+def recorder(mic):
+    cmd = ["pw-record", "--rate=16000", "--channels=1", "--format=s16", "--container=raw"]
+    if mic:
+        cmd.append(f"--target={mic}")
+    cmd.append("-")
+    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+
+def mic_exists(name):
+    """Whether PipeWire currently has a source under this exact node name."""
+    if not name:
+        return True  # the default source is by definition whatever exists
+    try:
+        dump = json.loads(subprocess.run(["pw-dump"], capture_output=True,
+                                         text=True, timeout=10).stdout)
+    except (json.JSONDecodeError, OSError, subprocess.TimeoutExpired):
+        return True  # cannot tell, so keep what was asked for rather than switch
+    return any(((obj.get("info") or {}).get("props") or {}).get("node.name") == name
+               for obj in dump)
+
+
+_idle_mic_cache = {}
+
+
+def idle_mic():
+    """A built-in microphone to fall back to when the headset should be released.
+
+    Cached: default_mic() opens a capture stream on each candidate to check it
+    is not deaf, which is far too slow to sit in the audio loop.
+    """
+    if "value" not in _idle_mic_cache:
+        _idle_mic_cache["value"] = default_mic()
+    return _idle_mic_cache["value"]
+
+
+def open_stream(mic, timeout=6):
+    """A recorder on a microphone that actually exists, and which one that is.
+
+    At boot the configured device routinely is not there yet - a Bluetooth
+    headset takes some seconds after login to connect. pw-record pointed at a
+    name PipeWire does not have does not fail: it quietly streams near-silence,
+    so the listener comes up deaf with nothing in the log to say why.
+
+    Waiting on the device to appear is the fix, and existence is the right thing
+    to wait on. Signal is not: a microphone in a silent room and a microphone
+    that is not there read the same, and only one of those is worth switching
+    away from.
+
+    The wait is short deliberately. It used to be a minute, which meant that on
+    any boot where the headset was slow to connect - which is most of them -
+    the listener spent its first minute deaf, waiting for a device instead of
+    listening on one it already had. The periodic recheck in the main loop
+    adopts the configured microphone within seconds of it appearing, so this
+    only has to outlast PipeWire's own startup, not Bluetooth pairing.
+    """
+    deadline = time.monotonic() + timeout
+    while not mic_exists(mic):
+        if time.monotonic() >= deadline:
+            fallback = default_mic()
+            print(f"{mic} never appeared; falling back to "
+                  f"{fallback or 'default source'}", flush=True)
+            mic = fallback
+            break
+        time.sleep(2)
+    return recorder(mic), mic
+
+
+def peak(chunk):
+    samples = array.array("h")
+    samples.frombytes(chunk[: len(chunk) - (len(chunk) % 2)])
+    return max((abs(s) for s in samples), default=0)
+
+
+def level(chunk):
+    """RMS, not peak: one click shouldn't read as a sentence."""
+    samples = array.array("h")
+    samples.frombytes(chunk[: len(chunk) - (len(chunk) % 2)])
+    if not samples:
+        return 0
+    return int((sum(s * s for s in samples) / len(samples)) ** 0.5)
+
+
+SPEAKING = RUN_DIR / "speaking"
+
+
+def is_speaking():
+    """True while the assistant has the floor, so it can ignore its own voice.
+
+    The microphone and the speaker are routinely the same Bluetooth headset. Left
+    to itself the listener hears every word it says, wakes on its own name, and
+    records the rest of its own sentence as the next command.
+
+    The flag holds a deadline rather than merely existing: omarchy-voice-say
+    could be killed between raising it and lowering it, and a flag that only
+    exists would then leave the listener deaf with no way back. A deadline in the
+    past is simply ignored.
+    """
+    try:
+        return time.time() < float(SPEAKING.read_text().strip())
+    except (OSError, ValueError):
+        return False
+
+
+def sleep_now(reason):
+    notify(f"{NAME} is asleep", f"{reason} — SUPER+ALT+Z or hold F10", "\U000f0f2d", 8000)
+    subprocess.run(["systemctl", "--user", "stop", "omarchy-voice-wake"],
+                   check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # systemd stops the unit; exit cleanly in case this is running by hand.
+    raise SystemExit(0)
+
+
+def capture_command(stream, config):
+    """Record until the speaker stops, then return the audio."""
+    frames = bytearray()
+    silence_needed = config["silence_ms"] / 1000
+    silent_for = 0.0
+    speech_for = 0.0
+    deadline = time.monotonic() + config["max_command_secs"]
+    seconds_per_chunk = (CHUNK / 2) / RATE
+
+    while time.monotonic() < deadline:
+        chunk = stream.read(CHUNK)
+        if not chunk:
+            break
+        frames += chunk
+        if level(chunk) < config["silence_level"]:
+            silent_for += seconds_per_chunk
+            if speech_for >= config["min_speech_ms"] / 1000 and silent_for >= silence_needed:
+                break
+        else:
+            silent_for = 0.0
+            speech_for += seconds_per_chunk
+
+    if speech_for < config["min_speech_ms"] / 1000:
+        return None
+    return bytes(frames)
+
+
+# A command that outlives this is wedged rather than slow: whisper takes a few
+# seconds and the planner is capped at 60, so nothing legitimate comes close.
+DISPATCH_TIMEOUT = 90
+
+_in_flight = threading.Lock()
+
+# When a follow-up may be spoken without the wake word. Set by the worker rather
+# than the audio loop, because the window has to open when the *answer* lands -
+# and the answer includes anything said out loud, which happens down inside the
+# dispatcher, seconds after this thread stopped caring.
+_followup_until = 0.0
+
+
+def run_command(path, followup_secs=0.0):
+    """Transcribe one recording and act on it. Never runs on the audio thread."""
+    try:
+        subprocess.run(
+            ["omarchy-voice-command", "file", str(path)],
+            check=False,
+            timeout=DISPATCH_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        logging.warning("command timed out after %ss", DISPATCH_TIMEOUT)
+        notify("That took too long", "Gave up on the last command", "\U000f0026")
+    except OSError as exc:
+        # Most likely PATH: the dispatcher lives in ~/.local/bin, and a service
+        # started before the session imported it would not see it at all.
+        logging.warning("could not run omarchy-voice-command: %s", exc)
+        notify("Voice control is broken", str(exc)[:120], "\U000f0026")
+    else:
+        try:
+            logging.info("heard command: %r", (RUN_DIR / "last.txt").read_text().strip())
+        except OSError:
+            pass
+    finally:
+        global _followup_until
+        _followup_until = time.monotonic() + followup_secs if followup_secs else 0.0
+        _in_flight.release()
+
+
+def dispatch(audio, followup_secs=0.0):
+    """Hand the recording to a worker so the microphone is never left unread.
+
+    This used to run inline, which meant the listener stopped hearing anything
+    for as long as the command took - and a command that opens a window (an
+    agent, a terminal) does not "take" seconds, it takes as long as the window
+    stays open. One at a time is still the right limit: a second command spoken
+    over the first is a correction or a mishearing, not a queue.
+    """
+    if not _in_flight.acquire(blocking=False):
+        logging.info("still busy with the last command, ignoring this one")
+        notify("Still working", "Finishing the last command", "\U000f0f2d")
+        return
+
+    try:
+        RUN_DIR.mkdir(parents=True, exist_ok=True)
+        path = RUN_DIR / "wake-command.wav"
+        with wave.open(str(path), "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(RATE)
+            wav.writeframes(audio)
+        logging.info("dispatching %.1fs of audio", len(audio) / (RATE * 2))
+        threading.Thread(target=run_command, args=(path, followup_secs),
+                         daemon=True).start()
+    except (OSError, RuntimeError, wave.Error):
+        _in_flight.release()
+        raise
+
+
+def main():
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print(__doc__)
+        print("Detector: openwakeword, in ~/.local/share/omarchy-wakeword/venv")
+        print("Service: systemctl --user {start,stop,enable,disable} omarchy-voice-wake")
+        return
+
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    config = load_config()
+    global NAME, _followup_until
+    NAME = agent_name(config)
+    mic = config["mic"] or default_mic()
+
+    model_path = find_wake_model(config["wake_model"])
+    detector = Model(wakeword_model_paths=[model_path])
+    key = next(iter(detector.models))
+    threshold = float(config["wake_threshold"])
+    refractory = float(config["wake_refractory_secs"])
+    wake_frames = max(1, int(config.get("wake_frames") or 3))
+    above = 0
+
+    # Captured before open_stream, which substitutes a working device when the
+    # configured one is absent. Reading it back afterwards recorded the
+    # substitute as the microphone that was wanted, so a headset connected later
+    # was never returned to - it stayed on the fallback for the life of the
+    # process, which is exactly as useless as it sounds.
+    configured_mic = mic
+    proc, mic = open_stream(mic)
+
+    # Why we are not on the configured device, which decides when to go back.
+    # A headset absent at startup should be adopted the moment it appears. One
+    # deliberately released after an idle period should not, or the idle logic
+    # would undo itself on the next check - that one waits until you speak.
+    fallback_reason = "startup" if mic != configured_mic else None
+    next_mic_check = time.monotonic() + MIC_RECHECK_SECS
+
+    if config["silence_level"] == "auto":
+        # Every one of these devices emits a click when the stream opens, so the
+        # first second is discarded and the floor is a median, not a max — one
+        # transient must not define what counts as silence for the whole session.
+        for _ in range(12):
+            proc.stdout.read(CHUNK)
+        samples = sorted(level(proc.stdout.read(CHUNK)) for _ in range(16))
+        floor = samples[len(samples) // 2]
+        config["silence_level"] = max(200, int(floor * 2.5))
+        print(f"noise floor {floor} -> silence below {config['silence_level']}", flush=True)
+
+    followup_secs = float(config.get("followup_secs") or 0)
+    idle_limit = float(config.get("sleep_after_minutes") or 0) * 60
+    last_wake = time.monotonic()
+    muted = False
+
+    # Audio already read while the detector was making up its mind. It fires at
+    # the end of the wake phrase, so without this the first fraction of the
+    # command is gone before recording starts - "bbc.co.uk" arriving as "c dot
+    # co dot uk". Replaying it puts the start back. It carries the wake phrase
+    # too, which is harmless: the dispatcher strips a leading "hey marvin".
+    preroll = collections.deque(maxlen=8)  # 640ms
+
+    minutes = config.get("sleep_after_minutes")
+    sleeps = f"; sleeps after {minutes} min idle" if idle_limit else ""
+    print(f"listening for {config['wake_model']} on {mic or 'default source'}{sleeps}", flush=True)
+    print(f"wake at score >= {threshold} held {wake_frames} frames"
+          f"{f'; {followup_secs:g}s follow-up window' if followup_secs else ''}", flush=True)
+
+    try:
+        while True:
+            chunk = proc.stdout.read(CHUNK)
+            if len(chunk) < CHUNK:
+                # The source vanished (headset off, device switch): reopen it.
+                time.sleep(3)
+                proc.kill()
+                proc = recorder(mic)
+                detector.reset()
+                continue
+
+            # Read it, then throw it away: the stream has to keep being drained
+            # or pw-record blocks, but none of this is you talking.
+            if is_speaking():
+                if not muted:
+                    logging.info("muted while speaking")
+                    muted = True
+                preroll.clear()
+                continue
+            if muted:
+                detector.reset()  # start from silence, not half its own last word
+                muted = False
+
+            if fallback_reason == "startup" and time.monotonic() >= next_mic_check:
+                next_mic_check = time.monotonic() + MIC_RECHECK_SECS
+                if mic_exists(configured_mic):
+                    logging.info("%s is back, moving to it", configured_mic)
+                    notify(f"{NAME} moved to your headset", configured_mic, "󰍬", 4000)
+                    proc.kill()
+                    mic, fallback_reason = configured_mic, None
+                    proc = recorder(mic)
+                    detector.reset()
+                    preroll.clear()
+                    continue
+
+            preroll.append(chunk)
+
+            # For a few seconds after an answer, carry on without the wake word.
+            # This is the difference between a conversation and a series of
+            # unrelated requests: "what's the weather" then "and tomorrow".
+            #
+            # It deliberately bypasses the one gate that keeps the room out, so
+            # it is kept narrow: only just after the assistant answered, only while
+            # nothing else is running, only for speech loud enough to be aimed
+            # at the machine, and the window closes the moment it is used or
+            # expires. Everything spoken still goes through the dispatcher's
+            # own filters for silence and hallucinated stock phrases.
+            if _followup_until and not _in_flight.locked():
+                if time.monotonic() >= _followup_until:
+                    _followup_until = 0.0
+                elif level(chunk) >= config["silence_level"]:
+                    _followup_until = 0.0
+                    logging.info("follow-up, no wake word needed")
+                    audio = capture_command(proc.stdout, config)
+                    if audio:
+                        dispatch(b"".join(preroll) + audio, followup_secs)
+                    preroll.clear()
+                    detector.reset()
+                    continue
+
+            score = float(detector.predict(np.frombuffer(chunk, dtype=np.int16))[key])
+
+            # How long the score is held, not how high it peaks. Peak alone
+            # could not separate the wake phrase from its near neighbours on
+            # an earlier model measured here: over fifteen synthesised samples
+            # the name inside an ordinary sentence reached 0.994 while a real
+            # wake bottomed out at 0.995 - overlapping, so no threshold divided
+            # them. Duration did. hey_marvin separates on peak too (0.117
+            # against 1.000), so this gate is a second line of defence now
+            # rather than the only one, and it stays for the next wake word
+            # that needs it.
+            # A real wake holds above the bar for eight or nine frames; the
+            # near-misses never cross it at all.
+            above = above + 1 if score >= threshold else 0
+            if above < wake_frames:
+                if idle_limit and time.monotonic() - last_wake > idle_limit:
+                    # Idle used to mean shutting down, and an assistant that
+                    # switches itself off after twenty quiet minutes is not one
+                    # you can rely on: you walk up, say the wake word, and
+                    # nothing happens. But the timer was never really about
+                    # idleness - it was about the headset, which an open capture
+                    # stream pins to HFP so music sounds like a phone call.
+                    #
+                    # Stepping off the headset onto a built-in microphone gets
+                    # that back without going deaf. Only when there is no other
+                    # microphone to move to does sleeping remain the answer.
+                    fallback = idle_mic()
+                    if fallback and fallback != mic:
+                        logging.info("idle: releasing %s, listening on %s", mic, fallback)
+                        notify(f"{NAME} moved to the built-in mic",
+                               "Headset audio quality restored; still listening", "󰍬", 6000)
+                        proc.kill()
+                        mic, fallback_reason = fallback, "idle"
+                        proc = recorder(mic)
+                        detector.reset()
+                        preroll.clear()
+                        last_wake = time.monotonic()
+                    elif not fallback:
+                        sleep_now(f"No wake word for {config['sleep_after_minutes']} minutes")
+                    else:
+                        last_wake = time.monotonic()  # already moved; stay awake
+                continue
+            if time.monotonic() - last_wake < refractory:
+                continue  # still the tail of the trigger we just acted on
+
+            logging.info("woke on %s (%.3f, held %d frames)",
+                         config["wake_model"], score, above)
+            above = 0
+            last_wake = time.monotonic()
+
+            notify("Yes?", "Listening for a command", "󰍬", 8000)
+            audio = capture_command(proc.stdout, config)
+            if audio:
+                dispatch(b"".join(preroll) + audio, followup_secs)
+            else:
+                notify("Nothing heard", "Say the command after the wake word", "󰍭")
+            preroll.clear()
+            detector.reset()
+            if fallback_reason and configured_mic and configured_mic != mic:
+                # Back to the better microphone now that it is being used again.
+                # Re-pinning the headset to HFP is the right trade while someone
+                # is actually talking to it.
+                logging.info("back to %s", configured_mic)
+                proc.kill()
+                mic, fallback_reason = configured_mic, None
+                proc = recorder(mic)
+                detector.reset()
+            time.sleep(config["cooldown_secs"])
+    except KeyboardInterrupt:
+        pass
+    finally:
+        proc.kill()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,19 @@
+[Unit]
+Description=Omarchy voice wake word listener
+After=pipewire.service wireplumber.service
+PartOf=graphical-session.target
+
+[Service]
+# The unit is wanted by default.target, which is reached before the Hyprland
+# session imports its environment - so a service started at boot could not find
+# omarchy-voice-command in ~/.local/bin and died on the first thing you said.
+# Spelling the PATH out here makes the boot instance identical to a restarted one.
+Environment=PATH=%h/.local/bin:/usr/share/omarchy/bin:%h/.local/share/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/bin
+Type=simple
+ExecStart=%h/.local/share/omarchy-wakeword/venv/bin/python %h/.local/bin/omarchy-voice-wake
+Restart=on-failure
+RestartSec=2
+Nice=5
+
+[Install]
+WantedBy=default.target

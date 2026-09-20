@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+
+# The live config is not tracked: it names the microphone by PipeWire node,
+# which for a Bluetooth headset embeds its MAC address. config/*.example is
+# the same file with that field blanked.
+voice-wake.json

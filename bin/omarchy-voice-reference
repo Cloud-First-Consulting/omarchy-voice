@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+
+# omarchy:summary=Build the Omarchy command reference the assistant answers from
+# omarchy:args=[--force] [--print]
+# omarchy:examples=omarchy-voice-reference --print
+
+"""Generate the Omarchy reference that omarchy-voice-help answers from.
+
+Built from `omarchy commands --all --json` on this machine rather than written
+by hand or recalled from training data. That matters more than it sounds: this
+install is 4.0.4-1 with 367 visible commands across 63 groups, and any answer
+sourced from memory would be describing some other version. Regenerating from
+the live system means the reference cannot drift from what is installed - and
+when Omarchy updates, so does the answer.
+
+The file is rebuilt automatically when the installed version changes.
+
+    omarchy-voice-reference            # rebuild if the version moved
+    omarchy-voice-reference --force    # rebuild regardless
+    omarchy-voice-reference --print    # write it to stdout
+"""
+
+import html.parser
+import json
+import pathlib
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+CACHE = pathlib.Path.home() / ".local/share/omarchy/reference.txt"
+HOTKEYS = pathlib.Path.home() / ".local/share/omarchy/hotkeys.txt"
+MANUAL_URL = "https://omarchy.org/manual/hotkeys"
+# The manual changes on Omarchy's schedule, not this machine's, so it is not
+# tied to the version stamp the rest of the reference uses.
+HOTKEYS_MAX_AGE = 7 * 24 * 3600
+TOPICS = pathlib.Path.home() / ".local/share/omarchy/topics.txt"
+STAMP = pathlib.Path.home() / ".local/share/omarchy/reference.version"
+
+
+def installed_version():
+    try:
+        return subprocess.run(["omarchy", "version"], capture_output=True,
+                              text=True, timeout=15).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+# Hyprland reports modifiers as a bitmask; these are the ones anyone presses.
+MODIFIERS = [(64, "SUPER"), (8, "ALT"), (4, "CTRL"), (1, "SHIFT")]
+
+
+def keybindings():
+    """Every active keybinding, as the combination you actually press.
+
+    Without this the answer to "how do I take a screenshot" is `omarchy capture
+    screenshot`, which is true and useless: this is a desktop, the question is
+    about a key, and the key is PRINT. Read live from Hyprland rather than from
+    the config files, so it reflects what is bound now including anything the
+    user has changed.
+    """
+    try:
+        raw = subprocess.run(["hyprctl", "binds", "-j"], capture_output=True,
+                             text=True, timeout=20).stdout
+        binds = json.loads(raw)
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return []
+
+    lines = []
+    for bind in binds:
+        keys = [name for mask, name in MODIFIERS if bind.get("modmask", 0) & mask]
+        key = bind.get("key") or ""
+        if not key:
+            continue
+        combination = "+".join(keys + [key])
+        what = (bind.get("description") or "").strip()
+        if not what:
+            # No description: the dispatcher is still better than nothing.
+            what = f'{bind.get("dispatcher", "")} {bind.get("arg", "")}'.strip()
+        if what:
+            lines.append(f"  {combination:<28} {what}")
+    return sorted(set(lines))
+
+
+class _Hotkeys(html.parser.HTMLParser):
+    """Pull the key/description tables out of the manual page.
+
+    The page is plain tables under section headings, so this needs no HTML
+    library beyond the one in the standard library - worth keeping that way,
+    since a voice assistant that cannot start because a scraping dependency
+    moved is a poor trade for a list of shortcuts.
+    """
+
+    SKIP = {"key", "keys", "hotkey", "hotkeys", "shortcut", "binding"}
+
+    def __init__(self):
+        super().__init__()
+        self.sections = []
+        self.buf, self.row = [], []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("h2", "h3", "td", "th"):
+            self.buf = []
+        if tag == "tr":
+            self.row = []
+
+    def handle_endtag(self, tag):
+        text = re.sub(r"\s+", " ", "".join(self.buf)).strip()
+        if tag in ("h2", "h3") and text:
+            # Headings carry a trailing "#" from the anchor link beside them.
+            self.sections.append((text.rstrip("#").strip(), []))
+        elif tag in ("td", "th"):
+            self.row.append(text)
+            self.buf = []
+        elif tag == "tr" and len(self.row) >= 2 and self.sections:
+            key, what = self.row[0], " ".join(self.row[1:]).strip()
+            if key and what and key.lower() not in self.SKIP:
+                self.sections[-1][1].append((key, what))
+
+    def handle_data(self, data):
+        self.buf.append(data)
+
+
+def manual_hotkeys(force=False):
+    """Omarchy's documented hotkeys, cached, or "" if they cannot be had.
+
+    These cover a layer the machine cannot report. `hyprctl binds` knows the
+    key that opens tmux; it has no idea what any key does once tmux has it, and
+    the same goes for Neovim, the terminal and the file manager. Those live in
+    the manual and nowhere else on disk.
+
+    They are documentation, not truth about this machine: upstream defaults,
+    which say nothing about what the user has rebound. Live bindings win
+    wherever the two overlap, which is why this is kept in its own section
+    rather than merged into the list above it.
+
+    Never fatal. No network, no cache, no section - the rest of the reference
+    is unaffected, because a shortcut list is not worth failing a boot over.
+    """
+    if not force and HOTKEYS.exists() and \
+            time.time() - HOTKEYS.stat().st_mtime < HOTKEYS_MAX_AGE:
+        try:
+            return HOTKEYS.read_text()
+        except OSError:
+            pass
+
+    text = ""
+    try:
+        request = urllib.request.Request(
+            MANUAL_URL, headers={"User-Agent": "omarchy-voice"})
+        with urllib.request.urlopen(request, timeout=15) as response:
+            page = response.read().decode("utf-8", "replace")
+        parser = _Hotkeys()
+        parser.feed(page)
+        lines = []
+        for name, rows in parser.sections:
+            if not rows:
+                continue
+            lines.append(f"  ({name})")
+            lines.extend(f"    {key:<26} {what}" for key, what in rows)
+        text = "\n".join(lines)
+    except (OSError, ValueError, urllib.error.URLError):
+        text = ""
+
+    if text:
+        try:
+            HOTKEYS.parent.mkdir(parents=True, exist_ok=True)
+            HOTKEYS.write_text(text)
+        except OSError:
+            pass
+        return text
+    try:
+        return HOTKEYS.read_text() if HOTKEYS.exists() else ""
+    except OSError:
+        return ""
+
+
+def build():
+    """Every visible command as one line: route, arguments, and what it does."""
+    try:
+        raw = subprocess.run(["omarchy", "commands", "--all", "--json"],
+                             capture_output=True, text=True, timeout=60).stdout
+        data = json.loads(raw)
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
+        sys.exit(f"could not read the Omarchy command list: {exc}")
+
+    items = data if isinstance(data, list) else next(
+        (v for v in data.values() if isinstance(v, list)), [])
+
+    groups = {}
+    for command in items:
+        if command.get("hidden"):
+            continue
+        line = command["route"]
+        if command.get("args"):
+            line += " " + command["args"]
+        line += f"  — {command.get('summary', '')}"
+        if command.get("requires_sudo"):
+            line += " [needs sudo]"
+        # An example is worth more than a summary when the arguments are the
+        # part someone is likely to get wrong - and an example that is just the
+        # route again teaches nothing, because the route is already on the line
+        # above it. So keep the ones that actually show an argument.
+        #
+        # This used to keep the first example and no others. Omarchy lists them
+        # simplest first, so for `omarchy display text size` that kept the bare
+        # invocation and threw away "omarchy display text size 16" - the only
+        # one carrying a value. Asked how to increase the text size, the model
+        # had nothing to go on and offered "a percentage like 120" for a knob
+        # that takes 9 to 20 px. It did not misread the reference; the value was
+        # never in it.
+        informative = [e for e in (command.get("examples") or [])
+                       if e.strip() and e.strip() != command["route"]]
+        for example in informative[:2]:
+            line += f"\n      e.g. {example}"
+        groups.setdefault(command.get("group") or "general", []).append(line)
+
+    # The command groups double as the vocabulary for deciding whether a
+    # question is about Omarchy at all. Taken from here rather than written by
+    # hand, so the router and the reference can never disagree about what
+    # Omarchy covers, and a new group is understood the moment it ships.
+    try:
+        TOPICS.parent.mkdir(parents=True, exist_ok=True)
+        TOPICS.write_text("\n".join(sorted(groups)) + "\n")
+    except OSError:
+        pass
+
+    out = [f"Omarchy {installed_version()} — every command available on this machine.", ""]
+
+    binds = keybindings()
+    if binds:
+        out += ["[keybindings — what to actually press; prefer these in answers]"]
+        out += binds
+        out += [""]
+
+    manual = manual_hotkeys()
+    if manual:
+        out += ["[documented hotkeys, from " + MANUAL_URL + "]",
+                "  Upstream defaults, including keys that belong to tmux, Neovim, the",
+                "  terminal and the file manager - which hyprctl cannot see, because they",
+                "  are bound inside those programs rather than by the window manager.",
+                "  Where this disagrees with the live keybindings above, the live ones are",
+                "  what this machine actually does.",
+                manual, ""]
+
+    for group in sorted(groups):
+        out.append(f"[{group}]")
+        out.extend("  " + line for line in sorted(groups[group]))
+        out.append("")
+    return "\n".join(out)
+
+
+def current(force=False):
+    """The reference text, rebuilt if the installed version has moved on."""
+    version = installed_version()
+    stale = force or not CACHE.exists() or (
+        STAMP.read_text().strip() if STAMP.exists() else None) != version
+    if stale:
+        text = build()
+        try:
+            CACHE.parent.mkdir(parents=True, exist_ok=True)
+            CACHE.write_text(text)
+            STAMP.write_text(version)
+        except OSError:
+            pass  # usable in memory even if it cannot be cached
+        return text
+    return CACHE.read_text()
+
+
+def main():
+    force = "--force" in sys.argv
+    text = current(force=force)
+    if "--print" in sys.argv:
+        print(text)
+    else:
+        print(f"{CACHE}: {len(text.splitlines())} lines, "
+              f"{len(text):,} chars, Omarchy {installed_version()}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

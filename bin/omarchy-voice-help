@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+
+# omarchy:summary=Answer a question about Omarchy, with the exact commands to run
+# omarchy:args=<question> [--run] [--text]
+# omarchy:examples=omarchy-voice-help "how do I change the theme"
+
+"""Answer a question about Omarchy itself.
+
+Distinct from omarchy-voice-plan, which turns a sentence into an action. This
+turns a sentence into an *explanation* - "how do I change the theme", "why is
+bluetooth not connecting", "what does omarchy update actually do" - and it
+answers from the command list on this machine rather than from recollection.
+
+That distinction is the whole point. There are 367 commands here across 63
+groups, on version 4.0.4-1, and an answer drawn from training data would be
+describing a different Omarchy. Everything below is grounded in
+omarchy-voice-reference, which is regenerated whenever the installed version
+changes, so a wrong version is a wrong answer that cannot happen silently.
+
+    omarchy-voice-help "how do I change the theme"
+    omarchy-voice-help "my bluetooth keeps disconnecting" --text   # no speech
+    omarchy-voice-help "turn on night light" --run                 # offer to run it
+"""
+
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+
+# resolve() follows the symlink from ~/.local/bin back into the repo, so the
+# shared module is found however this was invoked.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib"))
+from omarchy_voice_ui import Progress  # noqa: E402
+import omarchy_voice_agent as agent  # noqa: E402
+
+MODEL = os.environ.get("OMARCHY_VOICE_MODEL", "haiku")
+TIMEOUT = int(os.environ.get("OMARCHY_VOICE_TIMEOUT", "90"))
+GUIDE = pathlib.Path.home() / ".local/share/omarchy/last-answer.md"
+
+PROMPT = """\
+You answer questions about Omarchy, the Linux setup this machine runs (Arch,
+Hyprland, PipeWire). Answer only from the command reference below - it was
+generated from this exact machine, so it is authoritative and your own
+recollection of Omarchy is not. If the reference does not cover something, say
+so rather than inventing a command.
+
+{reference}
+
+Some context about the machine right now:
+{context}
+
+Reply with ONE JSON object and nothing else. No markdown fence.
+
+  {{"say": "<one or two sentences, read aloud>",
+    "keys": "<the key combination to press, or empty>",
+    "steps": ["<step>", "..."],
+    "commands": [["prog","arg"], ...],
+    "confidence": "high|low"}}
+
+  say         The answer, spoken. Short - one or two sentences, or three when
+              there is no shortcut and you are naming the alternatives. Lead
+              with the answer, not a preamble.
+  keys        The exact combination from the keybindings section, e.g. "PRINT"
+              or "SUPER+CTRL+SHIFT+SPACE". Empty only if nothing is bound.
+  steps       Written out for the screen, in order. Omit if it is a one-liner.
+  commands    argv arrays for the steps that are commands, in the same order,
+              ONLY if they are safe to run unattended and come from the
+              reference. Leave empty for anything destructive, anything needing
+              sudo, or anything you are unsure of.
+  confidence  "low" if the reference does not really answer this.
+
+Rules:
+- THE KEY COMBINATION COMES FIRST. This is a desktop. If something is bound to
+  a key, the answer is that key, and the command is at best a footnote: the
+  answer to "how do I take a screenshot" is "Press PRINT", not "run omarchy
+  capture screenshot". Say the keys aloud the way they are pressed - "Super
+  Control Shift Space" - and put the exact combination in "keys".
+- Only fall back to a command when nothing is bound to a key for it.
+- When nothing is bound for what was asked, the answer has three parts and you
+  owe all three: say so outright, give the command that does do it, and then
+  name the nearest keys that get close, each with what it ACTUALLY does.
+  Stopping at "there is no shortcut" is not an answer. Someone who asked for a
+  shortcut wants the closest thing to one, and the reference nearly always has
+  something adjacent worth knowing.
+- "keys" must be EMPTY unless that exact combination does the thing that was
+  asked. A near neighbour is not an answer, and putting it there tells someone
+  to press a key that will not do what they wanted. Name it in "say" and
+  "steps" instead, always with what it really does and how it differs.
+
+  Asked "how do I make the text bigger" where nothing is bound to text size:
+
+    say:   "There is no shortcut for text size. Run omarchy display text size
+            16 to set it in pixels. The closest keys are Super Slash and Super
+            Alt Slash, which step the whole display's scaling rather than the
+            text on its own."
+    keys:  ""
+    steps: ["Run: omarchy display text size 16   (takes 9 to 20 px)",
+            "Or SUPER+/ and SUPER+ALT+/ to step monitor scaling - that scales
+             everything, not only the text",
+            "SUPER+CTRL+Z zooms the screen temporarily, which is different again"]
+
+  That is the shape: the true answer first, then the honest alternatives, and
+  never an alternative dressed up as the answer. "Press SUPER+CTRL+Z to scale
+  text everywhere" would be simply false.
+- Order the alternatives by how useful they actually are, not by how similar the
+  words are. A key that changes the same thing and makes it stick comes before
+  one that only changes how it looks for a moment: asked to make text bigger,
+  display scaling outranks a screen magnifier, however much "zoom" sounds like
+  the word in the question.
+- NEVER INVENT AN ARGUMENT VALUE. Take it from the examples or the argument spec
+  in the reference. If neither gives one, name the argument instead of guessing
+  at a number - "a size in pixels" beats a percentage the command would reject.
+- Prefer an `omarchy ...` command over editing a file by hand; that is what
+  they are for.
+- Never suggest shutdown, reboot, logout, disk or drive operations as commands
+  to run - describe them in steps instead and let the user do it.
+- Quote the command exactly as the reference spells it, arguments included.
+- For a diagnosis, say what to check first and why, rather than listing
+  everything that could possibly be wrong.
+
+Voice: dry, understated, competent. State the thing and stop. No filler, no
+"certainly", no addressing the user as sir. It is read by a speech engine, so
+words rather than symbols, and no markdown in "say".
+
+The question: {question}\
+"""
+
+ALLOWED_PREFIX = ("omarchy", "hyprctl", "systemctl", "pactl", "wpctl", "bluetoothctl")
+FORBIDDEN = re.compile(
+    r"\b(shutdown|reboot|poweroff|halt|logout|mkfs|fdisk|luks|dd|rm)\b", re.I)
+
+
+def notify(title, body, icon="󰋗", timeout=9000):
+    try:
+        subprocess.run(["omarchy-notification-send", "-g", icon, title, body,
+                        "-t", str(timeout)], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
+def speak(text):
+    if not text.strip():
+        return
+    try:
+        subprocess.run(["omarchy-voice-say", text], check=False, timeout=60,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def reference():
+    try:
+        out = subprocess.run(["omarchy-voice-reference", "--print"],
+                             capture_output=True, text=True, timeout=60)
+        if out.stdout.strip():
+            return out.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    sys.exit("could not build the Omarchy reference")
+
+
+def machine_context():
+    """A few live facts, so a diagnosis can be about this machine, not any machine."""
+    facts = []
+    for label, argv in [
+        ("version", ["omarchy", "version"]),
+        ("bluetooth", ["omarchy", "bluetooth", "power", "is-on"]),
+        ("theme", ["omarchy", "theme", "current"]),
+    ]:
+        try:
+            out = subprocess.run(argv, capture_output=True, text=True, timeout=8)
+            value = (out.stdout or out.stderr).strip().splitlines()
+            if value and out.returncode == 0:
+                facts.append(f"  {label}: {value[0][:80]}")
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+    return "\n".join(facts) or "  (nothing gathered)"
+
+
+def vet(argv):
+    """A command may be offered only if it is recognisably an Omarchy-shaped one."""
+    if not argv or not all(isinstance(a, str) for a in argv):
+        return "malformed"
+    if argv[0] not in ALLOWED_PREFIX:
+        return f"{argv[0]} is not a command this will run"
+    joined = " ".join(argv)
+    if FORBIDDEN.search(joined):
+        return "does something that should be done by hand"
+    return None
+
+
+def ask(question):
+    prompt = PROMPT.format(reference=reference(), context=machine_context(),
+                           question=question)
+    result, error = agent.ask(prompt, model=MODEL, timeout=TIMEOUT)
+    if error:
+        return None, error
+    result = re.sub(r"^```(?:json)?|```$", "", result.strip(), flags=re.M).strip()
+    match = re.search(r"\{.*\}", result, re.S)
+    if not match:
+        return None, "no answer came back"
+    try:
+        return json.loads(match.group(0)), None
+    except json.JSONDecodeError:
+        return None, "the answer was not valid JSON"
+
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    flags = {a for a in sys.argv[1:] if a.startswith("--")}
+    question = " ".join(args).strip()
+    if not question:
+        sys.exit('usage: omarchy-voice-help "<question>" [--run] [--text]')
+
+    progress = Progress("Omarchy", enabled="--text" not in flags).start()
+    progress.stage("checking the command reference")
+    answer, error = ask(question)
+    if answer is None:
+        print(f"omarchy-voice-help: {error}", file=sys.stderr)
+        if not progress.finish("󰀦", "Omarchy", error):
+            notify("Couldn't answer that", error, "󰀦")
+        return 1
+
+    say = str(answer.get("say", "")).strip()
+    keys = str(answer.get("keys", "")).strip()
+    steps = [str(s) for s in (answer.get("steps") or [])]
+    commands = [c for c in (answer.get("commands") or []) if isinstance(c, list)]
+    low = str(answer.get("confidence", "")).lower() == "low"
+
+    print(say)
+    if keys:
+        print(f"\n  press:  {keys}")
+    if steps:
+        print()
+        for i, step in enumerate(steps, 1):
+            print(f"  {i}. {step}")
+    if commands:
+        print("\n  commands:")
+        for argv in commands:
+            reason = vet(argv)
+            print(f"    {'(not offered: ' + reason + ') ' if reason else ''}{' '.join(argv)}")
+    if low:
+        print("\n  (the reference does not really cover this - treat with suspicion)")
+
+    # Written out so a guide longer than a notification has somewhere to live.
+    try:
+        GUIDE.parent.mkdir(parents=True, exist_ok=True)
+        body = [f"# {question}", "", say, ""]
+        if keys:
+            body += [f"**Press:** `{keys}`", ""]
+        body += [f"{i}. {s}" for i, s in enumerate(steps, 1)]
+        if commands:
+            body += ["", "```"] + [" ".join(c) for c in commands] + ["```"]
+        GUIDE.write_text("\n".join(body) + "\n")
+    except OSError:
+        pass
+
+    headline = (f"{keys}\n" if keys else "") + say[:200]
+    if not progress.finish("󰄬" if not low else "󰀦", "Omarchy", headline):
+        notify("Omarchy" if not low else "Omarchy (unsure)", headline, "󰋗")
+    if "--text" not in flags:
+        speak(say)
+
+    if "--run" in flags and commands:
+        for argv in commands:
+            reason = vet(argv)
+            if reason:
+                print(f"  refused {' '.join(argv)}: {reason}", file=sys.stderr)
+                return 1
+        for argv in commands:
+            print(f"  running {' '.join(argv)}")
+            subprocess.run(argv, check=False)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

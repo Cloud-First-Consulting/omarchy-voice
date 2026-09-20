@@ -1,0 +1,731 @@
+#!/usr/bin/env python3
+"""Turn an arbitrary spoken sentence into actions on this machine.
+
+The phrase table in omarchy-voice-command handles the common commands with no
+model in the loop. This is what runs when nothing matched: it asks Claude which
+tool to use and with which arguments, then runs the result.
+
+Two rules make that safe enough to run unattended:
+
+  * The model returns argv arrays, never a shell string, and nothing is ever
+    passed to a shell — so there is no quoting, globbing or injection surface.
+  * Every argv[0] is checked against an allowlist. A plan that wants anything
+    else is reported to the user instead of run.
+
+A plan that ran cleanly is remembered, filed under the normalized phrase, so the
+second time you say something the model is not asked again. The allowlist is
+re-checked on every replay rather than trusted from the file - what is cached is
+the answer to "what did you mean", never permission to run it.
+
+    omarchy-voice-plan "open the browser and go to hacker news"
+    omarchy-voice-plan --learned          # what it has picked up so far
+    omarchy-voice-plan --forget "<phrase>" | --forget-all
+"""
+
+import datetime
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import tempfile
+
+# resolve() follows the symlink from ~/.local/bin back into the repo, so the
+# shared module is found however this was invoked.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib"))
+import omarchy_voice_agent as agent  # noqa: E402
+
+MODEL = os.environ.get("OMARCHY_VOICE_MODEL", "haiku")
+TIMEOUT = int(os.environ.get("OMARCHY_VOICE_TIMEOUT", "60"))
+
+CONFIG = pathlib.Path.home() / ".config/omarchy/voice-wake.json"
+
+# Phrases this script has already worked out, so it only ever pays for a given
+# wording once. Written here rather than into the table in omarchy-voice-command
+# on purpose: that table is hand-written and worth reading, and a file the
+# machine rewrites should not be something you have to diff.
+LEARNED = pathlib.Path.home() / ".local/share/omarchy/voice-learned.json"
+LEARNED_MAX = 200
+
+# The last few turns, so a follow-up can be understood as an answer rather than
+# as a fresh request out of nowhere. Lives in the runtime directory because it
+# is a conversation, not a setting: it should not survive a reboot.
+HISTORY = pathlib.Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "omarchy-voice/history.json"
+HISTORY_TURNS = 4
+HISTORY_TTL = 180  # seconds; past this it is a new conversation, not a follow-up
+
+# argv[0] must be one of these. Deliberately small: this list is the whole
+# security boundary, so it grows only when a real request needed it.
+ALLOWED = {
+    "omarchy", "hyprctl", "wpctl", "pactl", "playerctl", "brightnessctl",
+    "bluetoothctl", "xdg-open", "curl", "date", "cal", "uptime", "free",
+    "df", "du", "ip", "nmcli", "systemctl", "notify-send", "voxtype",
+    "omarchy-voice-browser", "omarchy-browser-control", "omarchy-window",
+}
+
+# Even inside the allowlist, some shapes are never acceptable from a mishearing.
+FORBIDDEN_ARGS = re.compile(r"^(poweroff|halt)$", re.I)
+
+# curl is on the allowlist for exactly one thing - the one-line weather in the
+# catalogue - so it is vetted by the shape it is actually used in rather than
+# by a list of the flags that are dangerous. That list kept losing:
+#
+#   curl -sO url        bundles into a single argument, so it matched no
+#                       exact-match rule for -o or -O
+#   curl -T file url    -T is --upload-file's short form
+#   curl -F f=@file     posts a file without using --data at all
+#   curl --data-raw     and --data-binary, and --json, all post a body
+#   curl -K file        reads *any* option at all out of a file, which defeats
+#                       argument filtering entirely
+#
+# Every one of those is a way to write a file to disk or send one off the
+# machine. Allowing only the flags a GET needs, and only http(s) targets, ends
+# the whole category instead of patching it one flag at a time.
+CURL_SAFE_FLAGS = {"--silent", "--show-error", "--location", "--compressed"}
+CURL_VALUE_FLAGS = {"-m", "--max-time", "--connect-timeout"}
+# Short flags safe to bundle: -s, -S, -L, and any combination like -sSL. The
+# bundling is the whole reason this is a set of letters rather than of strings,
+# because -sO is one argument and no exact-match rule ever sees the O in it.
+CURL_SAFE_SHORT = set("sSL")
+
+
+def vet_curl(argv):
+    """None if this is a plain GET of an http(s) URL, else why it is not."""
+    expect_value = False
+    target = False
+    for arg in argv[1:]:
+        if expect_value:
+            expect_value = False
+            continue
+        if arg in CURL_VALUE_FLAGS:
+            expect_value = True
+            continue
+        if arg in CURL_SAFE_FLAGS:
+            continue
+        if re.fullmatch(r"-[A-Za-z]+", arg):
+            bad = [c for c in arg[1:] if c not in CURL_SAFE_SHORT]
+            if bad:
+                return f"curl option -{bad[0]} is not allowed"
+            continue
+        if arg.startswith("-"):
+            return f"curl option {arg} is not allowed"
+        # A scheme that is not http(s) - file://, ftp://, scp:// - and a local
+        # path or @file are all ways to read the disk rather than the web.
+        if "://" in arg and not arg.startswith(("http://", "https://")):
+            return f"curl may only fetch http(s), not {arg}"
+        if arg.startswith(("/", ".", "~", "@")):
+            return f"curl may only fetch a URL, not the path {arg}"
+        target = True
+    return None if target else "curl needs a URL"
+
+CATALOGUE = """\
+omarchy agent                     open the Claude Code app - the coding agent that
+                                  runs in a terminal on THIS machine
+omarchy agent prompt "<task>"     open it with a task to work on
+omarchy-voice-browser [url]       open a page in the browser voice can act inside;
+                                  prefer this for any web request
+omarchy-browser-control "<what to do>"   click a button, fill a field, dismiss a
+                                  dialog, scroll or go back, inside that browser
+omarchy launch browser [url]      the everyday browser; voice cannot act inside it
+omarchy launch terminal           open a terminal
+omarchy launch nautilus           open the file manager
+omarchy launch editor <path>      open the default editor
+omarchy launch spotify|signal|1password
+omarchy theme set <name>          themes: Tokyo Night, Catppuccin, Nord, Gruvbox,
+                                  Everforest, Kanagawa, Rose Pine, Matte Black, ...
+omarchy theme bg next             next wallpaper
+omarchy toggle nightlight
+omarchy system lock               (shutdown/reboot are NOT available to you)
+omarchy audio output volume raise|lower|mute-toggle|+N|-N
+omarchy bluetooth power on|off|toggle
+omarchy bluetooth device connect|disconnect <address>
+omarchy capture screenshot [region|window|fullscreen]
+omarchy capture screenrecording [--fullscreen] [--stop-recording]
+omarchy reminder <minutes> "<text>"
+omarchy display text size <px>    text size everywhere; default 12, 14-16 is bigger
+omarchy hyprland monitor scaling up|down|<scale>
+hyprctl dispatch workspace <n>    switch workspace
+omarchy-window close <name>       close a NAMED window (class or title fragment).
+                                  Prefer this: when a command is spoken the
+                                  focused window is usually not the one meant.
+omarchy-window focus <name>       bring a named window to the front
+hyprctl dispatch killactive       close the focused window - only for "close
+                                  this window" about the window in front
+hyprctl dispatch fullscreen
+hyprctl eval "hl.config({ cursor = { zoom_factor = 1.5 } })"   screen zoom
+playerctl play-pause|next|previous
+wpctl set-volume|set-mute <id> ...
+curl -s "wttr.in/?format=3"       one-line weather here (geolocates by IP;
+                                  add a place only if the user named one)
+date, cal, uptime, free -h, df -h /   quick system facts
+systemctl --user start|stop omarchy-voice-wake   the wake word listener\
+"""
+
+PROMPT = """\
+You convert one spoken sentence into actions on an Omarchy Linux desktop
+(Arch Linux, Hyprland, PipeWire). The sentence was transcribed from speech, so
+expect missing punctuation and occasional mishearings.
+
+Available commands:
+{catalogue}
+
+Windows open right now (address, class, workspace, title):
+{windows}
+{history}
+Reply with ONE JSON object and nothing else. No markdown fence, no commentary.
+
+  {{"kind": "run", "say": "<3-6 word confirmation>", "commands": [["prog","arg"], ...]}}
+      Do something. Each command is an argv array, never a shell string.
+      Use several array entries for a multi-step request.
+
+  {{"kind": "report", "say": "<what you are checking>", "command": ["prog","arg"]}}
+      Answer a question about live state by running one command; its output is
+      shown to the user. Use for weather, disk, battery, uptime, date.
+
+  {{"kind": "answer", "say": "<one or two sentences>"}}
+      Answer from your own knowledge. No command is run.
+
+  {{"kind": "clarify", "say": "<what you need to know>"}}
+      The request is ambiguous or you cannot do it with the commands above.
+
+Rules:
+- Only use programs from the list above.
+- For a website, give the full https:// URL: "go to hacker news" ->
+  ["omarchy","launch","browser","https://news.ycombinator.com"].
+- Never shut down, reboot, log out, delete, or install anything. If asked,
+  use "clarify" and say it must be done by hand.
+- Prefer one command that does the job over several.
+- "the agent", "claude", "cloud", "claude code", "cloud code", "codex",
+  "cursor", "copilot", "gemini", "opencode" and "crush" all mean the coding
+  agent installed on this machine: use `omarchy agent`, which launches
+  whichever one the user has set as their default. Never open a vendor's
+  website in a browser for these, unless the user explicitly asked for it.
+- Do not ask which location the weather is for: wttr.in already knows where
+  this machine is. Only pass a place when the user names one.
+
+Voice and manner. "say" is spoken aloud, in the register of a dry, understated
+English butler. Competent and unhurried. State the thing and stop.
+
+- Short. One sentence, often a fragment. "The browser." not "I am opening the
+  browser for you now."
+- No filler and no eagerness: never "sure", "of course", "happy to", "right
+  away", "let me know if you need anything else".
+- Never address the user as sir, or as anything else. The manner is the
+  deference; an honorific turns it into pastiche.
+- Dry wit is permitted occasionally, and only where something is genuinely
+  absurd, repetitive or futile. A joke on every command stops being a joke by
+  the third one, so most replies should be plain. When in doubt, plain.
+- Refuse without apology or hedging: "That one you'll have to do yourself",
+  not "I'm sorry, but I'm unable to...".
+- Facts first, remark second if at all: "Fourteen degrees and raining."
+- It is read by a speech engine, so use words rather than symbols, and no
+  markdown, emoji or asterisks.
+
+The spoken sentence: {text}\
+"""
+
+HISTORY_BLOCK = """
+What was just said, oldest first. The new sentence is very likely a reply to
+your own last line, so read it that way: if you asked which window and the
+answer is "both of them", that is the answer - act on it rather than asking
+again. Do not repeat a question that has already been answered.
+
+{turns}
+"""
+
+
+def agent_name():
+    """What to call it in a notification, taken from the configured wake words.
+
+    The name lives in one place - "hey marvin" in voice-wake.json - so renaming
+    the assistant does not leave an older name behind in the corner of a screen.
+    """
+    try:
+        config = json.loads(CONFIG.read_text())
+    except (OSError, json.JSONDecodeError):
+        return "Marvin"
+    words = (config.get("wake_words") or ["marvin"])[0].split()
+    return words[-1].capitalize() if words else "Marvin"
+
+
+SYMBOLS = [
+    ("°C", " degrees"), ("°F", " degrees"), ("°", " degrees"),
+    ("%", " percent"), ("&", " and "), ("+", " "), ("→", " to "),
+]
+
+
+def speakable(text):
+    """A command's output as something worth hearing, or "" if it isn't.
+
+    Report output is written to be looked at. One line of it usually reads
+    aloud fine once the glyphs are gone - "Epsom, England, GB: 22 degrees". A
+    table does not: `df -h /` read out in full is "Filesystem Size Used Avail
+    Use percent Mounted on dev mapper root 475G 32G 442G 7 percent", which is
+    worse than silence. The notification already shows those properly, so this
+    returns nothing and lets the caller fall back to the short spoken line.
+    """
+    lines = [line for line in (text or "").splitlines() if line.strip()]
+    if len(lines) != 1:
+        return ""
+    out = lines[0]
+    for symbol, spoken in SYMBOLS:
+        out = out.replace(symbol, spoken)
+    out = "".join(c for c in out if c.isascii() and (c.isalnum() or c in " .,:'-"))
+    out = " ".join(out.split())
+    return out if len(out) <= 140 else ""
+
+
+def speak(text):
+    """Say something out loud, if speech is configured and available.
+
+    Blocking on purpose. omarchy-voice-say holds the listener muted for as long
+    as it is talking, and the wake service allows one command at a time, so
+    waiting here is what stops the assistant taking its own voice as the next
+    command. A voice that cannot be produced is never worth failing over.
+    """
+    if not text or not text.strip():
+        return
+    try:
+        subprocess.run(["omarchy-voice-say", text], check=False, timeout=45,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log("could not speak: %s", exc)
+
+
+def log(message, *args):
+    """One line to stderr per decision.
+
+    This runs as a grandchild of the wake service, so stderr lands in that
+    unit's journal next to the "heard command" it belongs to. Without it a
+    command that quietly did nothing leaves no trace at all: the plan, the
+    allowlist verdict and the launch all happened somewhere unobservable, and
+    working out which of them went wrong afterwards is guesswork.
+    """
+    print("voice-plan: " + (message % args if args else message),
+          file=sys.stderr, flush=True)
+
+
+def notify(title, body, icon="󰚩", timeout=6000):
+    try:
+        subprocess.run(
+            ["omarchy-notification-send", "-g", icon, title, body, "-t", str(timeout)],
+            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        # Losing a notification must never take the command down with it.
+        log("could not notify: %s", exc)
+
+
+def load_history():
+    """Recent turns, newest last, dropping anything too old to be a follow-up."""
+    try:
+        turns = json.loads(HISTORY.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(turns, list):
+        return []
+    now = datetime.datetime.now().timestamp()
+    fresh = [t for t in turns
+             if isinstance(t, dict) and now - float(t.get("at") or 0) < HISTORY_TTL]
+    return fresh[-HISTORY_TURNS:]
+
+
+def remember_turn(said, reply):
+    """Append this exchange, so the next sentence can be read as a reply to it."""
+    turns = load_history()
+    turns.append({"at": datetime.datetime.now().timestamp(), "said": said, "reply": reply})
+    try:
+        HISTORY.parent.mkdir(parents=True, exist_ok=True)
+        HISTORY.write_text(json.dumps(turns[-HISTORY_TURNS:]))
+    except OSError:
+        pass  # remembering is a convenience, never a reason to fail a command
+
+
+def load_learned():
+    try:
+        data = json.loads(LEARNED.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_learned(store):
+    # Least recently used first out, so a run of mishearings cannot crowd out the
+    # phrases actually in daily use.
+    if len(store) > LEARNED_MAX:
+        ordered = sorted(store.items(), key=lambda kv: kv[1].get("last", ""), reverse=True)
+        store = dict(ordered[:LEARNED_MAX])
+    try:
+        LEARNED.parent.mkdir(parents=True, exist_ok=True)
+        tmp = LEARNED.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(store, indent=2, ensure_ascii=False))
+        tmp.replace(LEARNED)
+    except OSError:
+        pass  # learning is an optimization; never fail a command over it
+
+
+def remember(key, say, commands, kind="run"):
+    if not key:
+        return
+    store = load_learned()
+    entry = store.get(key, {})
+    store[key] = {
+        "kind": kind,
+        "say": say,
+        "commands": commands,
+        "hits": entry.get("hits", 0) + 1,
+        "learned": entry.get("learned") or datetime.datetime.now().isoformat(timespec="seconds"),
+        "last": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+    save_learned(store)
+
+
+# Words whose presence flips a command into its opposite. Two phrases can look
+# nearly identical and mean contradictory things - "turn on bluetooth" and "turn
+# off bluetooth" share five sixths of their characters - so a near match is only
+# allowed when the two sides agree on every one of these.
+POLARITY = {
+    "on", "off", "open", "close", "up", "down", "in", "out", "raise", "lower",
+    "mute", "unmute", "start", "stop", "enable", "disable", "next", "previous",
+    "increase", "decrease", "lock", "unlock", "louder", "quieter", "more", "less",
+}
+
+
+def close_enough(said, learned):
+    """Whether two normalized phrases are the same request worded differently.
+
+    Containment rather than similarity: "what's the weather" and "what's the
+    weather like today" are one intent, and every string-distance measure scores
+    them poorly because one is half the length of the other. What matters is
+    whether the shorter phrase is essentially contained in the longer one.
+
+    Character similarity is the wrong tool for a second reason - it rates "turn
+    on bluetooth" and "turn off bluetooth" at well over ninety percent, and
+    those are opposites. Hence the polarity check, which is not a heuristic so
+    much as a refusal to guess.
+    """
+    a, b = set(said.split()), set(learned.split())
+    if not a or not b:
+        return False
+    shared = a & b
+    if len(shared) < 2:
+        return False  # one word in common is a coincidence, not a paraphrase
+    if (a ^ b) & POLARITY:
+        return False  # they disagree about a word that reverses the meaning
+    return len(shared) / min(len(a), len(b)) >= 0.8
+
+
+def recall(key):
+    """A previously learned plan for this phrase, or None.
+
+    Re-vetted here rather than trusted: the file is machine-written and sits in
+    a writable directory, so it is treated as a suggestion with exactly the same
+    standing as the model's - it proposes, the allowlist disposes.
+    """
+    if not key:
+        return None
+    store = load_learned()
+    entry, matched = store.get(key), key
+
+    # Speech does not repeat itself exactly. "What's the weather like today" and
+    # "What's the weather" were two entries and two model calls, which is most
+    # of why forty-six commands cost ninety-seven of them. Exact first, so the
+    # common case stays cheap and predictable, then the nearest paraphrase.
+    if entry is None:
+        for candidate, value in store.items():
+            if close_enough(key, candidate):
+                entry, matched = value, candidate
+                break
+
+    if not isinstance(entry, dict):
+        return None
+    commands = entry.get("commands")
+    if not isinstance(commands, list) or not commands:
+        return None
+    if any(vet(argv) for argv in commands):
+        return None
+    if matched != key:
+        log("matched %r to what was learned for %r", key, matched)
+    return entry
+
+
+def open_windows():
+    try:
+        proc = subprocess.run(["omarchy-window", "list"], capture_output=True, text=True, timeout=5)
+        return proc.stdout.strip() or "(none)"
+    except (OSError, subprocess.TimeoutExpired):
+        return "(unknown)"
+
+
+def ask_model(text, history=()):
+    block = ""
+    if history:
+        turns = "\n".join(f'  you said: "{t.get("said","")}"\n'
+                           f'  {agent_name()} replied: "{t.get("reply","")}"'
+                           for t in history)
+        block = HISTORY_BLOCK.format(turns=turns)
+    prompt = PROMPT.format(catalogue=CATALOGUE, windows=open_windows(),
+                           history=block, text=text)
+    result, error = agent.ask(prompt, model=MODEL, timeout=TIMEOUT)
+    if error:
+        return None, error
+
+    # Fenced JSON is common even when asked for bare JSON.
+    result = re.sub(r"^```(?:json)?|```$", "", result.strip(), flags=re.M).strip()
+    match = re.search(r"\{.*\}", result, re.S)
+    if not match:
+        return None, "the model did not return a plan"
+    try:
+        return json.loads(match.group(0)), None
+    except json.JSONDecodeError:
+        return None, "the model's plan was not valid JSON"
+
+
+def vet(argv):
+    """Return None if this command may run, else why it may not."""
+    if not argv or not isinstance(argv, list) or not all(isinstance(a, str) for a in argv):
+        return "malformed command"
+    if argv[0] not in ALLOWED:
+        return f"{argv[0]} is not on the allowlist"
+    if argv[0] == "curl":
+        return vet_curl(argv)
+    # nmcli prints saved wifi passwords in the clear when asked for secrets, and
+    # an answer this produces can be spoken aloud and cached.
+    if argv[0] == "nmcli" and any(a in {"-s", "--show-secrets"} for a in argv[1:]):
+        return "network secrets are not available to voice"
+    # xdg-open hands whatever it is given to the desktop's registered handler,
+    # so a local path opens a file and a non-http scheme picks the handler for
+    # that scheme. It is here to open web pages; that is all it may do.
+    if argv[0] == "xdg-open":
+        for arg in argv[1:]:
+            if not arg.startswith(("http://", "https://")):
+                return f"xdg-open may only open http(s) URLs, not {arg}"
+    if argv[0] == "systemctl" and "--user" not in argv:
+        return "only user services may be controlled"
+    if argv[0] == "omarchy" and len(argv) > 2 and argv[1] == "system" and argv[2] in {"shutdown", "reboot", "logout"}:
+        return "power actions are not available to voice"
+    for arg in argv[1:]:
+        if FORBIDDEN_ARGS.match(arg):
+            return f"argument {arg} is not allowed"
+    return None
+
+
+def run(argv, capture=False):
+    return subprocess.run(
+        argv, capture_output=capture, text=True, timeout=30,
+        stdout=None if capture else subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL if not capture else None,
+    )
+
+
+def spawn(argv, grace=0.25):
+    """Start a command without taking ownership of how long it lives.
+
+    A voice command that opens something - an agent, a terminal, a browser -
+    keeps running for as long as that window does. Waiting on it would pin this
+    script, omarchy-voice-command above it, and the wake listener above that, to
+    the lifetime of a window the user just asked to open. So: start it in its own
+    session, and wait only long enough to catch the ones that fail immediately.
+
+    Returns None if it started cleanly, else why it did not.
+    """
+    # stderr goes to a temporary file rather than a pipe. A pipe would be the
+    # obvious choice and it is a trap here: nothing reads it once the grace
+    # period is over, so a program chatty enough to fill the 64K buffer - which
+    # is to say any browser, given long enough - would block forever on a write
+    # nobody is draining, and appear to freeze halfway through opening.
+    with tempfile.TemporaryFile(mode="w+") as errfile:
+        try:
+            proc = subprocess.Popen(argv, start_new_session=True,
+                                    stdout=subprocess.DEVNULL, stderr=errfile)
+        except (OSError, ValueError) as exc:
+            return str(exc)[:120]
+        try:
+            proc.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            return None  # still running, which is what opening a window looks like
+        if proc.returncode != 0:
+            errfile.seek(0)
+            tail = errfile.read().strip().splitlines()
+            return tail[-1][:120] if tail else f"exited {proc.returncode}"
+    return None
+
+
+def execute(commands, say, text, key=None):
+    """Vet, then start, every command in a plan. Returns True if all of it ran."""
+    if not commands:
+        log("plan had no commands for %r", text)
+        notify("Couldn't work that out", f"“{text}”", "󰀦")
+        return False
+    for argv in commands:
+        reason = vet(argv)
+        if reason:
+            log("refused %s: %s", " ".join(argv), reason)
+            notify("Not allowed", f"{reason} — “{text}”", "󰀦")
+            speak(reason)
+            return False
+    for argv in commands:
+        failure = spawn(argv)
+        if failure:
+            log("failed to start %s: %s", " ".join(argv), failure)
+            notify("That didn't work", f"{' '.join(argv)[:80]}: {failure}"[:160], "󰀦")
+            speak("That didn't work.")
+            return False
+        log("started %s", " ".join(argv))
+    notify(say, f"“{text}”", "󰄬")
+    if key:
+        remember(key, say, commands)
+        log("learned %r", key)
+    else:
+        # Silent before, and the exact reason a command could run correctly and
+        # still never be remembered - with nothing anywhere to say so.
+        log("no normalized key, so not learning %r", text)
+    return True
+
+
+def report(argv, say, text, key=None):
+    """Answer a question about live state by running one command and reading it out.
+
+    Worth remembering even though the answer changes every time: what was
+    learned is which command answers "what's the weather", not what the weather
+    was. Asking twice re-runs curl and reads today's number, without paying for
+    the model to work out that it is curl again.
+    """
+    reason = vet(argv)
+    if reason:
+        log("refused %s: %s", " ".join(argv), reason)
+        notify("Not allowed", f"{reason} — “{text}”", "󰀦")
+        speak(reason)
+        return False
+    try:
+        proc = run(argv, capture=True)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        log("failed to run %s: %s", " ".join(argv), exc)
+        notify("That didn't work", str(exc)[:120], "󰀦")
+        speak("That didn't work.")
+        return False
+
+    output = (proc.stdout or proc.stderr or "").strip()
+    log("ran %s -> %r", " ".join(argv), output[:80])
+    notify(say, output[:300] if output else "(no output)", "󰚩", 12000)
+    # The answer is the output, not the "checking the weather" that preceded it,
+    # so that is what gets read out - unless it is a table, which is unlistenable.
+    speak(speakable(output) or say)
+    if key:
+        remember(key, say, [argv], kind="report")
+        log("learned %r", key)
+    return True
+
+
+def show_learned():
+    store = load_learned()
+    if not store:
+        print("nothing learned yet")
+        return
+    for phrase, entry in sorted(store.items(), key=lambda kv: kv[1].get("hits", 0), reverse=True):
+        print(f"{entry.get('hits', 0):4}x  {phrase}")
+        for argv in entry.get("commands") or []:
+            reason = vet(argv)
+            print(f"          {'REFUSED: ' if reason else ''}{' '.join(argv)}")
+
+
+def main():
+    argv = sys.argv[1:]
+
+    if argv and argv[0] == "--learned":
+        show_learned()
+        return
+    if argv and argv[0] == "--forget-all":
+        save_learned({})
+        print("forgot everything")
+        return
+    if argv and argv[0] == "--forget":
+        store = load_learned()
+        phrase = " ".join(argv[1:]).strip()
+        print("forgot" if store.pop(phrase, None) else "not learned", f"“{phrase}”")
+        save_learned(store)
+        return
+
+    text = " ".join(argv).strip()
+    if not text:
+        sys.exit('usage: omarchy-voice-plan "<spoken sentence>" | --learned | --forget <phrase> | --forget-all')
+
+    dry = os.environ.get("OMARCHY_VOICE_DRY") == "1"
+
+    # The phrase as the table would have looked it up, so what is learned here is
+    # keyed the same way the hand-written table is - "can you open the browser"
+    # and "open the browser" are one entry, not two.
+    key = os.environ.get("OMARCHY_VOICE_NORMALIZED", "").strip().lower()
+
+    # Said this before? Then it has already been worked out once, and asking
+    # again would buy nothing but a few seconds of latency.
+    log("heard %r (key %r)", text, key)
+
+    history = load_history()
+    if history:
+        log("carrying %d recent turn(s) into the prompt", len(history))
+
+    known = recall(key)
+    if known and not dry:
+        log("replaying a learned plan, no model needed")
+        if known.get("kind") == "report":
+            report(known["commands"][0], known.get("say") or text, text, key=key)
+        else:
+            execute(known["commands"], known.get("say") or text, text, key=key)
+        return
+    if known and dry:
+        print(f"learned: {json.dumps(known['commands'], ensure_ascii=False)}")
+        return
+
+    if not dry:
+        notify("Working on it", f"“{text}”", "󰚩", 4000)
+    plan, error = ask_model(text, history)
+    if plan is None:
+        log("no plan: %s", error)
+        notify("Couldn't work that out", f"{error} — “{text}”", "󰀦")
+        return
+
+    kind = plan.get("kind")
+    say = str(plan.get("say", "")).strip() or text
+    remember_turn(text, say)
+
+    # A plan that leaned on the conversation is not safe to file under its
+    # wording alone: "close them" resolves only against the turn before it, and
+    # replaying that later, cold, would act on whatever happened to be open.
+    if history:
+        log("context-dependent, so not learning %r", key)
+        key = None
+    log("plan %s: %s", kind, json.dumps(plan.get("commands") or plan.get("command") or plan.get("say", ""), ensure_ascii=False))
+
+    if dry:
+        print(json.dumps(plan, ensure_ascii=False))
+        for argv in ([plan["command"]] if plan.get("command") else plan.get("commands") or []):
+            reason = vet(argv)
+            print("   ", "REFUSED:" if reason else "allowed:", " ".join(argv), f"({reason})" if reason else "")
+        return
+
+    # What gets spoken: answers, questions back, and things that went wrong.
+    # Not confirmations - a browser opening announces itself by opening, and
+    # narrating every action is what makes an assistant tiring to live with.
+    if kind in ("answer", "clarify"):
+        notify(agent_name() if kind == "answer" else "Need more detail", say,
+               "󰚩" if kind == "answer" else "󰋗", 10000)
+        speak(say)
+        return
+
+    if kind == "report":
+        report(plan.get("command") or [], say, text, key=key)
+        return
+
+    if kind == "run":
+        # Only a plan that actually ran is worth keeping: a refusal or a command
+        # that failed on the spot is not something to repeat from memory.
+        execute(plan.get("commands") or [], say, text, key=key)
+        return
+
+    notify("Couldn't work that out", f"“{text}”", "󰀦")
+
+
+if __name__ == "__main__":
+    main()
