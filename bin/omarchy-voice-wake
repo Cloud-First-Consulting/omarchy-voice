@@ -49,6 +49,7 @@ import json
 import logging
 import os
 import pathlib
+import signal
 import subprocess
 import sys
 import threading
@@ -359,8 +360,39 @@ def is_speaking():
         return False
 
 
-def sleep_now(reason):
+# Set once the state file has been told this process is going away, so the
+# specific reason wins over the generic one the exit path would write after it.
+_recorded_stop = False
+
+
+def record_stop(reason):
+    """Tell anything watching that this listener is no longer listening."""
+    global _recorded_stop
+    if _recorded_stop:
+        return
+    _recorded_stop = True
     write_state(listening=False, asleep=True, reason=reason)
+
+
+def on_terminate(signum, _frame):
+    """SIGTERM is how systemd stops this, which is a person pressing stop.
+
+    Without this the process simply dies, the state file keeps its last word -
+    "listening" - and the bar goes on drawing a listening icon over a service
+    that is not running. Raising SystemExit rather than exiting here lets the
+    normal shutdown path run, so the microphone is released as usual.
+
+    The state is recorded here rather than left to the exit path, because a stop
+    can arrive before the main loop has started - startup waits on Bluetooth and
+    probes microphones - and the exit path belongs to a loop that would never
+    have been entered. record_stop is idempotent, so the later write is a no-op.
+    """
+    record_stop("stopped")
+    raise SystemExit(0)
+
+
+def sleep_now(reason):
+    record_stop(reason)
     notify(f"{NAME} is asleep", f"{reason} — SUPER+ALT+Z or hold F10", "\U000f0f2d", 8000)
     subprocess.run(["systemctl", "--user", "stop", "omarchy-voice-wake"],
                    check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -471,6 +503,13 @@ def main():
         print("Detector: openwakeword, in ~/.local/share/omarchy-wakeword/venv")
         print("Service: systemctl --user {start,stop,enable,disable} omarchy-voice-wake")
         return
+
+    # Registered before anything slow, not after. Startup waits on a Bluetooth
+    # device and then probes each built-in microphone, which can run to a dozen
+    # seconds - and a stop arriving inside that window used to kill the process
+    # before anything had agreed to notice, leaving the bar drawing a listening
+    # icon over a service that had never finished starting.
+    signal.signal(signal.SIGTERM, on_terminate)
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     config = load_config()
@@ -670,6 +709,10 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        # Every way out of the loop ends here - stopped by systemd, interrupted
+        # by hand, or fallen out of it - and all of them mean the same thing to
+        # a reader of the state file.
+        record_stop("stopped")
         proc.kill()
 
 
