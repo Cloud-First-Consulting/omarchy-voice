@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+
+# omarchy:summary=Show or change the microphone it listens on and the speaker it talks through
+# omarchy:args=[mic|output <node-name>|default] [speech on|off] [--json]
+# omarchy:examples=omarchy-voice-audio | omarchy-voice-audio speech off
+
+"""Which microphone the wake word listens on, which speaker it answers through.
+
+Changing it used to mean editing voice-wake.json by hand and remembering to
+restart the service, which is a poor fit for something the bar widget offers as
+a menu.
+
+Two things are deliberately kept apart here:
+
+  the *configured* microphone   what you asked for, in voice-wake.json
+  the *open* microphone         what the listener actually has, which differs
+                                while the configured one is absent or released
+
+Setting a microphone writes the first. The listener decides the second, and
+will still step onto a built-in device when it releases a headset - so this
+does not promise the thing you picked is the thing that is open right now.
+
+Input and output are configured separately because they are separate choices.
+The listener holds a capture stream open all day, which pins a Bluetooth headset
+to its call-quality profile, so it is often right to listen on a built-in
+microphone while still answering through the headset.
+
+    omarchy-voice-audio                       what is open, configured, and available
+    omarchy-voice-audio --json                the same, for the bar widget
+    omarchy-voice-audio mic bluez_input.XX    listen on this source
+    omarchy-voice-audio output alsa_output.X  answer through this sink
+    omarchy-voice-audio mic default           no preference; pick a built-in one
+    omarchy-voice-audio output default        answer through the system default
+    omarchy-voice-audio speech off            answer in writing only
+
+Speech can be turned off without turning anything else off. Answers still
+appear - the notification is drawn and the text is printed exactly as before -
+they simply are not read out, which is what you want in a room with other
+people in it. It is a separate switch from listening, because not wanting to be
+spoken to is not the same as not wanting to be heard.
+"""
+
+import json
+import os
+import pathlib
+import subprocess
+import sys
+
+CONFIG = pathlib.Path.home() / ".config/omarchy/voice-wake.json"
+STATE = pathlib.Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "omarchy-voice/state.json"
+UNIT = "omarchy-voice-wake"
+
+
+def devices(media_class):
+    """Every PipeWire node of this class, listed fresh each run."""
+    try:
+        dump = json.loads(subprocess.run(["pw-dump"], capture_output=True,
+                                         text=True, timeout=10).stdout)
+    except (json.JSONDecodeError, OSError, subprocess.TimeoutExpired):
+        return []
+    found = []
+    for obj in dump:
+        props = (obj.get("info") or {}).get("props") or {}
+        if props.get("media.class") != media_class:
+            continue
+        name = props.get("node.name")
+        if not name:
+            continue
+        found.append({
+            "node": name,
+            # The nick before the description, because the description is the
+            # card name with the port tacked on: every output on this machine
+            # reads "Alder Lake-N PCH High Definition Audio Controller ..." and
+            # truncates to something identical in a menu. The nick is the part
+            # that differs - "HDMI 3", "Headphones", "LG TV SSCR2". Bluetooth
+            # devices have no nick and a description that is already the name of
+            # the thing, so they fall through to it.
+            "description": props.get("node.nick") or props.get("node.description") or name,
+            "bluetooth": str(name).startswith("bluez"),
+            "builtin": str(name).startswith("alsa_"),
+        })
+    return sorted(found, key=lambda s: s["description"].lower())
+
+
+def sources():
+    return devices("Audio/Source")
+
+
+def sinks():
+    return devices("Audio/Sink")
+
+
+def config():
+    try:
+        return json.loads(CONFIG.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def state():
+    try:
+        return json.loads(STATE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def set_device(key, node):
+    """Write the preference and restart, so the change takes effect now."""
+    data = config()
+    data[key] = node
+    try:
+        CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        tmp = CONFIG.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, indent=2) + "\n")
+        tmp.replace(CONFIG)
+    except OSError as exc:
+        sys.exit(f"could not write {CONFIG}: {exc}")
+
+    # Only the capture stream is held open across a whole session; the speaker is
+    # chosen per utterance, so changing it needs no restart.
+    if key == "mic":
+        subprocess.run(["systemctl", "--user", "restart", UNIT], check=False)
+    return node
+
+
+def main():
+    args = [a for a in sys.argv[1:] if a != "--json"]
+    as_json = "--json" in sys.argv[1:]
+
+    if args:
+        what = args[0]
+
+        if what == "speech":
+            if len(args) < 2 or args[1] not in ("on", "off"):
+                sys.exit("omarchy-voice-audio speech on|off")
+            data = config()
+            data["speak"] = args[1] == "on"
+            try:
+                tmp = CONFIG.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(data, indent=2) + "\n")
+                tmp.replace(CONFIG)
+            except OSError as exc:
+                sys.exit(f"could not write {CONFIG}: {exc}")
+            # Read fresh for every utterance, so nothing needs restarting.
+            print(f"speech: {'on' if data['speak'] else 'off - answers in writing only'}")
+            return 0
+
+        if what not in ("mic", "output"):
+            sys.exit('usage: omarchy-voice-audio [mic|output <node|default>] [speech on|off] [--json]')
+        if len(args) < 2:
+            sys.exit(f"omarchy-voice-audio {what} needs a node name, or 'default'")
+        wanted = args[1]
+        node = "" if wanted in ("default", "builtin", "built-in", "") else wanted
+        available = sources() if what == "mic" else sinks()
+        if node and not any(d["node"] == node for d in available):
+            # Not fatal: a headset that is switched off right now is still a
+            # perfectly reasonable thing to want to use when it comes back.
+            print(f"note: {node} is not present right now; saved anyway", file=sys.stderr)
+        set_device("mic" if what == "mic" else "speaker", node)
+        default_text = "(a built-in one)" if what == "mic" else "(the system default)"
+        print(f"configured {what}: {node or default_text}")
+        return 0
+
+    live, cfg = state(), config()
+    if as_json:
+        print(json.dumps({
+            "open": live.get("mic", ""),
+            "configured": cfg.get("mic", ""),
+            "configured_output": cfg.get("speaker", ""),
+            "on_fallback": bool(live.get("on_fallback")),
+            "fallback_reason": live.get("fallback_reason"),
+            "listening": bool(live.get("listening")),
+            "speak": bool(cfg.get("speak", True)),
+            "sources": sources(),
+            "sinks": sinks(),
+        }, indent=2))
+        return 0
+
+    print(f"open now:    {live.get('mic') or '(unknown - is the listener running?)'}")
+    print(f"configured:  {cfg.get('mic') or '(a built-in one)'}")
+    if live.get("on_fallback"):
+        print(f"             on a fallback ({live.get('fallback_reason')})")
+    print("\nmicrophones:")
+    for source in sources():
+        mark = "*" if source["node"] == live.get("mic") else " "
+        print(f"  {mark} {source['description']}")
+        print(f"      {source['node']}")
+
+    print(f"\nspeech:      {'on' if cfg.get('speak', True) else 'off - answers in writing only'}")
+    print(f"speaker:     {cfg.get('speaker') or '(the system default)'}")
+    print("\noutputs:")
+    for sink in sinks():
+        mark = "*" if sink["node"] == cfg.get("speaker") else " "
+        print(f"  {mark} {sink['description']}")
+        print(f"      {sink['node']}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

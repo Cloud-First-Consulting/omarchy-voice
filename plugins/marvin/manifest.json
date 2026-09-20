@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "omarchy-voice.marvin",
+  "name": "Marvin",
+  "version": "1.0.0",
+  "author": "Cloud First Consulting",
+  "license": "MIT",
+  "description": "The voice assistant in the bar: whether it is listening, which microphone it has, and one click to change either.",
+  "kinds": ["bar-widget"],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Marvin",
+    "description": "One bar icon showing whether the wake word is listening and on which microphone, and a panel to stop it, start it, or move it to another input.",
+    "category": "Audio",
+    "aliases": ["marvin", "voice", "wake-word"],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

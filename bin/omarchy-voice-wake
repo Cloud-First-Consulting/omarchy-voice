@@ -254,6 +254,33 @@ def level(chunk):
 
 SPEAKING = RUN_DIR / "speaking"
 
+# What the bar widget reads. Written here rather than scraped from the journal,
+# because the journal is a record of what happened and this is a question about
+# what is true now - "which microphone is open" has one answer, and parsing it
+# back out of log lines would invent a second place for it to be wrong.
+#
+# Rewritten whole on every transition, never appended to, so a reader either
+# sees the previous state or the next one and never half of each.
+STATE = RUN_DIR / "state.json"
+
+
+def write_state(**fields):
+    """Record the listener's current state for anything watching it."""
+    try:
+        RUN_DIR.mkdir(parents=True, exist_ok=True)
+        current = {}
+        if STATE.exists():
+            try:
+                current = json.loads(STATE.read_text())
+            except (json.JSONDecodeError, OSError):
+                current = {}
+        current.update(fields, updated=time.time())
+        tmp = STATE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(current, indent=2) + "\n")
+        tmp.replace(STATE)  # atomic, so a reader never sees a partial write
+    except OSError:
+        pass  # a widget going stale is not worth failing a wake word over
+
 
 def is_speaking():
     """True while the assistant has the floor, so it can ignore its own voice.
@@ -274,6 +301,7 @@ def is_speaking():
 
 
 def sleep_now(reason):
+    write_state(listening=False, asleep=True, reason=reason)
     notify(f"{NAME} is asleep", f"{reason} — SUPER+ALT+Z or hold F10", "\U000f0f2d", 8000)
     subprocess.run(["systemctl", "--user", "stop", "omarchy-voice-wake"],
                    check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -439,6 +467,9 @@ def main():
 
     minutes = config.get("sleep_after_minutes")
     sleeps = f"; sleeps after {minutes} min idle" if idle_limit else ""
+    write_state(listening=True, asleep=False, mic=mic, configured_mic=configured_mic,
+                on_fallback=bool(fallback_reason), fallback_reason=fallback_reason,
+                name=NAME, model=config["wake_model"], reason="started")
     print(f"listening for {config['wake_model']} on {mic or 'default source'}{sleeps}", flush=True)
     print(f"wake at score >= {threshold} held {wake_frames} frames"
           f"{f'; {followup_secs:g}s follow-up window' if followup_secs else ''}", flush=True)
@@ -473,6 +504,8 @@ def main():
                     notify(f"{NAME} moved to your headset", configured_mic, "󰍬", 4000)
                     proc.kill()
                     mic, fallback_reason = configured_mic, None
+                    write_state(mic=mic, on_fallback=False, fallback_reason=None,
+                                reason="configured microphone reappeared")
                     proc = recorder(mic)
                     detector.reset()
                     preroll.clear()
@@ -536,6 +569,8 @@ def main():
                                "Headset audio quality restored; still listening", "󰍬", 6000)
                         proc.kill()
                         mic, fallback_reason = fallback, "idle"
+                        write_state(mic=mic, on_fallback=True, fallback_reason="idle",
+                                    reason="released the headset while idle")
                         proc = recorder(mic)
                         detector.reset()
                         preroll.clear()
@@ -568,6 +603,8 @@ def main():
                 logging.info("back to %s", configured_mic)
                 proc.kill()
                 mic, fallback_reason = configured_mic, None
+                write_state(mic=mic, on_fallback=False, fallback_reason=None,
+                            reason="spoken to, so back to the better microphone")
                 proc = recorder(mic)
                 detector.reset()
             time.sleep(config["cooldown_secs"])

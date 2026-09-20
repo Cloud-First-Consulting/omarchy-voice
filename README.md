@@ -306,14 +306,56 @@ margin is one quiet room away from misfiring.
 Those get stripped off the front of a command exactly as the name is; take them
 from your own journal once you have used it for a while.
 
-### Choosing the microphone
+### In the bar
 
-`mic` takes a PipeWire node name - `pw-dump | jq -r '.[].info.props."node.name"'`
-lists them. Left empty it uses a built-in microphone rather than the system
-default, deliberately: an always-open capture stream pins a Bluetooth headset to
-HFP and costs you A2DP quality all day. If the named device is absent at start
-it falls back to a built-in one and adopts the real one within seconds of it
-appearing.
+    omarchy plugin enable omarchy-voice.marvin right
+
+A figure-speaking icon that says whether it is listening, and a panel that stops
+it, starts it, and moves it between microphones and speakers. It reads the state
+file the listener writes on every transition rather than scraping the journal,
+and every button runs the same command you would type, so the bar and the
+terminal cannot drift into disagreeing.
+
+The icon is deliberately not a microphone: Omarchy's own Microphone widget
+already draws one, and two identical icons in a bar teach nobody anything.
+
+    omarchy-shell omarchy-voice.marvin toggle    # for a keybinding
+
+### Choosing the microphone and the speaker
+
+    omarchy-voice-audio                       what is open, configured, available
+    omarchy-voice-audio mic <node>            listen on this one
+    omarchy-voice-audio output <node>         answer through this one
+    omarchy-voice-audio mic default           no preference; a built-in one
+    omarchy-voice-audio output default        follow the system default
+
+They are separate choices on purpose. The listener holds a capture stream open
+all day, which pins a Bluetooth headset to its call-quality profile, so it is
+often right to listen on a built-in microphone while still answering through the
+headset.
+
+`mic` left empty uses a built-in microphone rather than the system default,
+deliberately: an always-open capture stream pins a Bluetooth headset to HFP and
+costs you A2DP quality all day. If the named device is absent at start it falls
+back to a built-in one and adopts the real one within seconds of it appearing.
+`speaker` left empty follows the system default, which is usually right - speech
+should come out wherever everything else does.
+
+Changing the microphone restarts the listener, because the stream is opened once
+at startup. Changing the speaker does not, because it is chosen fresh for each
+thing it says.
+
+### Turning speech off
+
+    omarchy-voice-audio speech off
+
+Answers stop being read out and nothing else changes: the notification is still
+drawn and the text is still printed, so you read the answer instead of hearing
+it. Useful in a room with other people in it.
+
+This is a separate switch from listening on purpose. Not wanting to be spoken to
+is not the same as not wanting to be heard, and the two go wrong in different
+places - one is a room full of people, the other is a meeting.
 
 ## Layout
 
@@ -326,6 +368,8 @@ appearing.
     bin/omarchy-voice-reference    builds that answer's source from the live system
     bin/omarchy-voice-browser      a Chromium profile voice is allowed to drive
     bin/omarchy-browser-control    acts inside that page: click, type, dismiss
+    bin/omarchy-voice-audio        which microphone it hears on, which speaker it answers through
+    plugins/marvin/                the bar widget: state, and one click to change either
     bin/omarchy-voice-wake-test    detector regression suite, scores real audio
     bin/omarchy-voice-wake-check   post-boot health check
     bin/omarchy-voice-wake-toggle  start/stop, for a keybinding

@@ -50,6 +50,21 @@ for skill in "$REPO"/skills/*/; do
   done
 done
 
+# Shell plugins, linked the same way. Only into a directory that already
+# exists, so this never creates a plugin folder on a machine whose shell does
+# not use one. The shell picks the change up on its own; `omarchy restart shell`
+# forces it.
+PLUGIN_DIR="$HOME/.config/omarchy/plugins"
+for plugin in "$REPO"/plugins/*/; do
+  [[ -f $plugin/manifest.json ]] || continue
+  id=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['id'])" "$plugin/manifest.json" 2>/dev/null) || continue
+  [[ -n $id ]] || continue
+  mkdir -p "$PLUGIN_DIR"
+  ln -sfn "${plugin%/}" "$PLUGIN_DIR/$id"
+  echo "  linked plugin $id"
+  echo "    enable it with: omarchy plugin enable $id right"
+done
+
 # Never overwrite a real config: it names this machine's microphone.
 if [[ ! -f $CONFIG ]]; then
   cp "$REPO/config/voice-wake.json.example" "$CONFIG"

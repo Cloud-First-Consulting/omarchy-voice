@@ -39,7 +39,7 @@ text="${*:-}"
 
 # One interpreter start for every setting, rather than one per setting. Also
 # reads the model's own sample rate, which raw output does not carry.
-read -r enabled voice speed rate < <(python3 - "$CONFIG" "$PIPER_DIR" <<'PY'
+read -r enabled voice speed rate speaker < <(python3 - "$CONFIG" "$PIPER_DIR" <<'PY'
 import json, pathlib, sys
 cfg_path, piper_dir = sys.argv[1], sys.argv[2]
 try:
@@ -61,11 +61,22 @@ except Exception:
     pass
 # piper measures pace as length_scale, where bigger is slower - the opposite of
 # how anyone thinks about it, so the config takes speed and it is inverted here.
-print("yes" if cfg.get("speak", True) else "no", voice, f"{1/speed:.3f}", rate)
+# The speaker is printed last and as a single field: an empty one collapses to
+# nothing, and `read` then leaves the shell variable empty, which is exactly
+# "no preference, use the system default".
+print("yes" if cfg.get("speak", True) else "no", voice, f"{1/speed:.3f}", rate,
+      (cfg.get("speaker") or "").strip() or "-")
 PY
 )
 
 [[ $enabled == "yes" ]] || exit 0
+
+# Which sink to answer through. Unset means the system default, which is the
+# right default: speech should follow wherever the rest of the machine is
+# playing unless someone has deliberately said otherwise. Unlike the
+# microphone, this is chosen per utterance, so a change needs no restart.
+target=()
+[[ -n ${speaker:-} && $speaker != "-" ]] && target=(--target "$speaker")
 
 model="$PIPER_DIR/voices/$voice.onnx"
 if [[ ! -x $PIPER_DIR/piper || ! -f $model ]]; then
@@ -90,7 +101,7 @@ printf '%s\n' "$deadline" >"$FLAG"
 printf '%s' "$spoken" |
   LD_LIBRARY_PATH="$PIPER_DIR" "$PIPER_DIR/piper" \
     --model "$model" --length_scale "$speed" --output_raw 2>/dev/null |
-  pw-play --rate="$rate" --channels=1 --format=s16 --raw - >/dev/null 2>&1
+  pw-play "${target[@]}" --rate="$rate" --channels=1 --format=s16 --raw - >/dev/null 2>&1
 status=${PIPESTATUS[2]}
 
 sleep "$TAIL_SECS"
