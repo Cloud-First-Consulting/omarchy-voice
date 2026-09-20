@@ -69,6 +69,7 @@ Panel {
   }
 
   FileView {
+    id: stateFile
     // The listener rewrites this whole, so a read is either the old state or the
     // new one and never half of each.
     path: Quickshell.env("XDG_RUNTIME_DIR") + "/omarchy-voice/state.json"
@@ -79,12 +80,31 @@ Panel {
       try {
         root.state = JSON.parse(String(text() || ""))
       } catch (e) {
-        root.state = null
+        // Keep the last good reading rather than blanking. A parse failure here
+        // means a read landed on something unfinished, which is a moment to sit
+        // out, not a reason to redraw the bar as though nothing were running.
       }
     }
     // Absent means the listener has never run this boot, which is a state worth
     // drawing rather than an error worth logging.
     onLoadFailed: root.state = null
+  }
+
+  // The watch alone is not enough, and the reason is in the writer: the listener
+  // writes a temporary file and renames it over this one, so that a reader gets
+  // either the old state or the new one and never half of each. That rename
+  // swaps the file out from under the watch, which goes on watching something
+  // that no longer has a name - and the bar sat showing a sleeping icon over a
+  // listener that had been started again.
+  //
+  // Weakening the writer to keep the watch happy would trade a real guarantee
+  // for a convenience. Re-reading on a timer costs a few hundred bytes off tmpfs
+  // and converges within a couple of seconds when the watch misses.
+  Timer {
+    interval: 2000
+    running: true
+    repeat: true
+    onTriggered: stateFile.reload()
   }
 
   // The device list is asked for, not watched: it only changes when hardware
