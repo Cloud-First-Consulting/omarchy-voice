@@ -171,26 +171,50 @@ piper voice works; put its name in `voice` in the config.
     cd omarchy-voice
     ./install.sh
 
-`install.sh` symlinks `bin/*` into `~/.local/bin`, links `skills/*` into
-whichever of `~/.agents/skills`, `~/.claude/skills` and `~/.codex/skills`
-already exist, installs and enables the user unit, and creates
-`~/.config/omarchy/voice-wake.json` from the example if you do not already have
-one. It never overwrites an existing config, because that file
-names your microphone. If anything above is missing it says which and stops
-rather than starting something that cannot work.
+`install.sh`:
+
+- symlinks `bin/*` into `~/.local/bin`
+- links `skills/*` into whichever of `~/.agents/skills`, `~/.claude/skills` and
+  `~/.codex/skills` already exist
+- links `plugins/*` into `~/.config/omarchy/plugins/` by the id in each
+  manifest, and prints the command to enable it
+- installs and enables the user unit
+- creates `~/.config/omarchy/voice-wake.json` from the example if you do not
+  already have one
+
+It never overwrites an existing config, because that file names your
+microphone. If anything above is missing it says which and stops rather than
+starting something that cannot work.
 
 Symlinks rather than copies, so editing the clone edits the running system.
 Keep the clone somewhere permanent - moving it breaks the links until you run
 `install.sh` again.
 
-### 4. Check it
+### 4. The bar icon, optional
+
+    omarchy plugin enable omarchy-voice.marvin right
+
+Linking a plugin makes it available; it does not put it in your bar, because
+where things sit in your bar is your decision. `left` and `center` work too.
+
+The icon is a figure speaking, deliberately not a microphone: Omarchy's own
+Microphone widget already draws one, and two identical icons in a bar teach
+nobody anything. It shows whether the wake word is listening, and the panel
+behind it stops it, starts it, turns speech on and off, and moves it between
+microphones and speakers. See [In the bar](#in-the-bar).
+
+    omarchy plugin disable omarchy-voice.marvin    # take it back out
+    omarchy restart shell                          # if it does not appear
+
+### 5. Check it
 
     omarchy-voice-wake-check     # did it come up healthy on this boot
     omarchy-voice-wake-test      # score the detector against real audio
+    omarchy-voice-audio          # what it hears on, what it answers through
 
 Then say "Hey Marvin, open the browser".
 
-### 5. Keybindings, optional
+### 6. Keybindings, optional
 
 Not installed for you, since they are yours. In `~/.config/hypr/bindings.lua`:
 
@@ -198,6 +222,7 @@ Not installed for you, since they are yours. In `~/.config/hypr/bindings.lua`:
 o.bind("F10", "Voice command (push-to-talk)", "omarchy-voice-command start")
 o.bind("F10", "Voice command (run)", "omarchy-voice-command stop", { release = true })
 o.bind("SUPER + ALT + Z", "Toggle wake word", "omarchy-voice-wake-toggle")
+o.bind("SUPER + ALT + M", "Marvin panel", "omarchy-shell omarchy-voice.marvin toggle")
 ```
 
 Push-to-talk is the same dispatcher without the wake word, which is useful in a
@@ -308,18 +333,23 @@ from your own journal once you have used it for a while.
 
 ### In the bar
 
-    omarchy plugin enable omarchy-voice.marvin right
+Enabled in [step 4](#4-the-bar-icon-optional). The icon says whether the wake
+word is listening; click it for the panel.
 
-A figure-speaking icon that says whether it is listening, and a panel that stops
-it, starts it, and moves it between microphones and speakers. It reads the state
-file the listener writes on every transition rather than scraping the journal,
-and every button runs the same command you would type, so the bar and the
-terminal cannot drift into disagreeing.
+| | |
+|---|---|
+| top | stop or start listening, and turn speech on or off |
+| microphone | which one it hears on, ticked on the one actually open |
+| speaker | which one it answers through, or the system default |
 
-The icon is deliberately not a microphone: Omarchy's own Microphone widget
-already draws one, and two identical icons in a bar teach nobody anything.
+Inputs measured as hearing nothing are greyed out and labelled rather than
+dropped, so picking one by accident is hard and understanding why is easy.
 
-    omarchy-shell omarchy-voice.marvin toggle    # for a keybinding
+It reads the state file the listener writes on every transition rather than
+scraping the journal, and every button runs the same command you would type -
+so the bar and the terminal cannot drift into disagreeing about what is true.
+
+    omarchy-shell omarchy-voice.marvin toggle    # open it from a keybinding
 
 ### Choosing the microphone and the speaker
 
