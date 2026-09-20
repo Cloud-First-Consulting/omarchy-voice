@@ -345,6 +345,14 @@ Changing the microphone restarts the listener, because the stream is opened once
 at startup. Changing the speaker does not, because it is chosen fresh for each
 thing it says.
 
+Inputs that were measured and heard nothing are listed greyed out and labelled
+"hears nothing" rather than quietly dropped: an input can be silent because it
+is muted rather than because it is unwired, so it stays selectable and explains
+itself. Levels are cached for six hours; `omarchy-voice-audio probe` re-measures
+now. Only built-in inputs are probed - opening a capture stream on a Bluetooth
+headset would drag it onto its call-quality profile, which is the exact thing
+the rest of this goes out of its way to avoid.
+
 ### Turning speech off
 
     omarchy-voice-audio speech off

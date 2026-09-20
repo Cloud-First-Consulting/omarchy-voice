@@ -332,15 +332,24 @@ Panel {
                   // Ticked when it is the one actually open, not merely the one
                   // configured: this list answers "what am I hearing you on".
                   text: modelData.node === root.openMic ? "󰄬"
+                        : modelData.silent === true ? "󰍭"
                         : modelData.bluetooth ? "󰂯" : "󰍬"
-                  color: modelData.node === root.openMic ? root.foreground : root.dim
+                  color: modelData.silent === true ? Qt.darker(root.dim, 1.35)
+                         : modelData.node === root.openMic ? root.foreground : root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.icon
                 }
 
                 Text {
+                  // An input that was measured and heard nothing is still
+                  // listed, and still selectable - it may simply be muted, and
+                  // a device that quietly vanishes from a menu is worse than one
+                  // that explains itself. It says so rather than pretending to
+                  // be an equal choice.
                   text: String(modelData.description)
-                  color: modelData.node === root.openMic ? root.foreground : root.dim
+                        + (modelData.silent === true ? "   hears nothing" : "")
+                  color: modelData.silent === true ? Qt.darker(root.dim, 1.35)
+                         : modelData.node === root.openMic ? root.foreground : root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.body
                   textFormat: Text.PlainText

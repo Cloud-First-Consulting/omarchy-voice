@@ -32,6 +32,7 @@ microphone while still answering through the headset.
     omarchy-voice-audio mic default           no preference; pick a built-in one
     omarchy-voice-audio output default        answer through the system default
     omarchy-voice-audio speech off            answer in writing only
+    omarchy-voice-audio probe                 re-measure what each input hears
 
 Speech can be turned off without turning anything else off. Answers still
 appear - the notification is drawn and the text is printed exactly as before -
@@ -40,13 +41,20 @@ people in it. It is a separate switch from listening, because not wanting to be
 spoken to is not the same as not wanting to be heard.
 """
 
+import array
 import json
 import os
 import pathlib
 import subprocess
 import sys
+import time
 
 CONFIG = pathlib.Path.home() / ".config/omarchy/voice-wake.json"
+LEVELS = pathlib.Path.home() / ".local/share/omarchy/voice-mic-levels.json"
+LEVELS_MAX_AGE = 6 * 3600
+# Matches the listener's own thresholds; see pick_builtin_mic there.
+SIGNAL_FLOOR = 120.0
+SIGNAL_RATIO = 4.0
 STATE = pathlib.Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "omarchy-voice/state.json"
 UNIT = "omarchy-voice-wake"
 
@@ -90,6 +98,89 @@ def sinks():
     return devices("Audio/Sink")
 
 
+def probe_level(node, seconds=0.5):
+    """Mean level of a short capture, or None if it could not be measured."""
+    # pw-record runs until it is stopped, so this reads exactly as much as it
+    # wants and then kills it. Waiting for the process to exit on its own means
+    # waiting forever, and a timeout would throw the audio away with it.
+    want = int(16000 * 2 * seconds)
+    try:
+        proc = subprocess.Popen(
+            ["pw-record", f"--target={node}", "--rate=16000", "--channels=1",
+             "--format=s16", "--container=raw", "-"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:
+        return None
+    raw = b""
+    try:
+        while len(raw) < want:
+            chunk = proc.stdout.read(want - len(raw))
+            if not chunk:
+                break
+            raw += chunk
+    except OSError:
+        raw = b""
+    finally:
+        proc.kill()
+        proc.wait(timeout=5)
+    samples = array.array("h")
+    samples.frombytes(raw[: len(raw) - (len(raw) % 2)])
+    if not samples:
+        return None
+    return (sum(v * v for v in samples) / len(samples)) ** 0.5
+
+
+def measured_levels(force=False):
+    """How much each built-in input is hearing, cached.
+
+    Only built-in inputs are probed. Opening a capture stream on a Bluetooth
+    headset drags it onto its call-quality profile, which is precisely the thing
+    this whole project goes out of its way not to do - and a headset that is
+    connected is not the device anyone suspects of being deaf.
+    """
+    nodes = [d["node"] for d in devices("Audio/Source") if d["builtin"]]
+    cached = {}
+    try:
+        cached = json.loads(LEVELS.read_text())
+    except (OSError, json.JSONDecodeError):
+        cached = {}
+    fresh = (not force
+             and cached.get("measured", 0) + LEVELS_MAX_AGE > time.time()
+             and set(cached.get("levels", {})) == set(nodes))
+    if fresh:
+        return cached.get("levels", {})
+
+    levels = {}
+    for node in nodes:
+        value = probe_level(node)
+        if value is not None:
+            levels[node] = round(value, 1)
+    try:
+        LEVELS.parent.mkdir(parents=True, exist_ok=True)
+        LEVELS.write_text(json.dumps({"measured": time.time(), "levels": levels},
+                                     indent=2) + "\n")
+    except OSError:
+        pass
+    return levels
+
+
+def mark_silent(found, levels):
+    """Flag inputs that are demonstrably not hearing anything.
+
+    Only when another input is clearly hearing the room, because in a quiet room
+    every reading is small and says nothing about which jack is wired.
+    """
+    usable = [v for v in levels.values() if v is not None]
+    best = max(usable) if usable else 0.0
+    confident = best >= SIGNAL_FLOOR
+    for device in found:
+        level = levels.get(device["node"])
+        device["level"] = level
+        device["silent"] = bool(confident and level is not None
+                                and level * SIGNAL_RATIO < best)
+    return found
+
+
 def config():
     try:
         return json.loads(CONFIG.read_text())
@@ -129,6 +220,12 @@ def main():
 
     if args:
         what = args[0]
+
+        if what == "probe":
+            levels = measured_levels(force=True)
+            for node, value in sorted(levels.items(), key=lambda kv: -kv[1]):
+                print(f"  {value:8.1f}  {node}")
+            return 0
 
         if what == "speech":
             if len(args) < 2 or args[1] not in ("on", "off"):
@@ -171,7 +268,7 @@ def main():
             "fallback_reason": live.get("fallback_reason"),
             "listening": bool(live.get("listening")),
             "speak": bool(cfg.get("speak", True)),
-            "sources": sources(),
+            "sources": mark_silent(sources(), measured_levels()),
             "sinks": sinks(),
         }, indent=2))
         return 0
@@ -181,9 +278,10 @@ def main():
     if live.get("on_fallback"):
         print(f"             on a fallback ({live.get('fallback_reason')})")
     print("\nmicrophones:")
-    for source in sources():
+    for source in mark_silent(sources(), measured_levels()):
         mark = "*" if source["node"] == live.get("mic") else " "
-        print(f"  {mark} {source['description']}")
+        note = "  (hears nothing - is anything wired to it?)" if source["silent"] else ""
+        print(f"  {mark} {source['description']}{note}")
         print(f"      {source['node']}")
 
     print(f"\nspeech:      {'on' if cfg.get('speak', True) else 'off - answers in writing only'}")
