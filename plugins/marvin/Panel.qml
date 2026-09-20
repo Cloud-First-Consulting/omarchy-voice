@@ -253,6 +253,36 @@ Panel {
             }
           }
 
+          // ---------- Speech ----------
+          Row {
+            width: parent.width
+            spacing: Style.space(10)
+
+            Text {
+              width: parent.width - speechToggle.width - Style.space(10)
+              // A separate switch from listening on purpose: not wanting to be
+              // spoken to is not the same as not wanting to be heard.
+              text: root.speaks
+                    ? "Answers are spoken. Turn off to read them instead."
+                    : "Answers are written only - the notification still appears."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              textFormat: Text.PlainText
+              wrapMode: Text.WordWrap
+            }
+
+            PanelActionButton {
+              id: speechToggle
+              iconText: root.speaks ? "󰕿" : "󰝟"
+              tooltipText: root.speaks ? "Stop speaking answers" : "Speak answers again"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              bordered: true
+              onClicked: root.setSpeech(!root.speaks)
+            }
+          }
+
           PanelSeparator {
             width: parent.width
             foreground: root.foreground
@@ -326,41 +356,6 @@ Panel {
                 cursorShape: Qt.PointingHandCursor
                 onClicked: root.choose("mic", String(modelData.node))
               }
-            }
-          }
-
-          PanelSeparator {
-            width: parent.width
-            foreground: root.foreground
-          }
-
-          // ---------- Speech ----------
-          Row {
-            width: parent.width
-            spacing: Style.space(10)
-
-            Text {
-              width: parent.width - speechToggle.width - Style.space(10)
-              // A separate switch from listening on purpose: not wanting to be
-              // spoken to is not the same as not wanting to be heard.
-              text: root.speaks
-                    ? "Answers are spoken. Turn off to read them instead."
-                    : "Answers are written only - the notification still appears."
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              textFormat: Text.PlainText
-              wrapMode: Text.WordWrap
-            }
-
-            PanelActionButton {
-              id: speechToggle
-              iconText: root.speaks ? "󰕿" : "󰝟"
-              tooltipText: root.speaks ? "Stop speaking answers" : "Speak answers again"
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              bordered: true
-              onClicked: root.setSpeech(!root.speaks)
             }
           }
 
