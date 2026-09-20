@@ -71,6 +71,11 @@ one covers *changing* a binding and never tells an agent to read the live ones.
   allowed programs will do anything given the right flag, so `curl`, `nmcli`
   and `xdg-open` are checked by the shape they are used in. Test changes
   against `vet()` directly.
+- **Window titles reaching the planner are attacker-controlled.** A web page
+  sets its own title, and that list lands in a prompt whose output becomes
+  commands. Do not widen what the planner may run on the strength of something
+  it was *told*; in particular do not put anything that acts on a page back on
+  its allowlist. A browser action requires the user to have spoken one.
 - **The assistant's name comes from config**, never from a literal in the
   source. `wake_words` and `wake_aliases` in `~/.config/omarchy/voice-wake.json`
   drive every regex that matches it.
