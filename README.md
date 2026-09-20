@@ -586,6 +586,56 @@ about windows. That is the argv design working - nothing reaches a shell.
     omarchy-default-agent        # which agent will answer
     journalctl --user -u omarchy-voice-wake -f
 
+## Third-party licences
+
+This repository contains no third-party code. Every file in it is original: no
+models, no binaries, no fonts, no vendored libraries. Everything else is
+fetched from its own upstream by the install steps, so nothing here is
+redistributed and the licences below govern *your use* of what you install,
+not anything obtained from this project.
+
+| what | licence |
+|---|---|
+| openWakeWord (code) | Apache-2.0 |
+| **openWakeWord pre-trained models** | **CC BY-NC-SA 4.0 — non-commercial** |
+| onnxruntime | MIT |
+| numpy, scipy | BSD-3-Clause |
+| piper | MIT (its bundled espeak-ng is GPL-3.0) |
+| **en_GB-alan-medium voice** | **unclear — see below** |
+| PipeWire, jq, voxtype, Omarchy | MIT |
+| Quickshell (loads the bar widget) | LGPL-3.0-only |
+| coding agent CLIs | each vendor's own terms; run, never redistributed |
+
+Two of those deserve more than a row.
+
+**The wake word model is non-commercial.** openWakeWord's own README is explicit:
+the code is Apache-2.0, but "all of the included pre-trained models are licensed
+under CC BY-NC-SA 4.0 due to the inclusion of datasets with unknown or
+restrictive licensing as part of the training data". `hey_marvin_v0.1` is one of
+those, so the default configuration of this project depends on a model that may
+not be used commercially.
+
+There is a clean way out, and it is a path this already documents: train your
+own. openWakeWord generates its training data synthetically, so a model you
+train is yours, carries none of that restriction, and drops in by setting
+`wake_model`. See [Changing the wake word](#changing-the-wake-word). That is the
+supported answer for commercial use, not a workaround.
+
+**The default voice's licensing is murky.** `rhasspy/piper-voices` is tagged MIT
+at the repository level, but the `en_GB-alan-medium` model card defers to its
+source, and that source - `MycroftAI/mimic3-voices`, voice `en_UK/apope_low` -
+ships a LICENSE file reading "Copyright 2022 Mycroft AI. All Rights Reserved",
+inside a repository whose own licence is CC-BY-SA-4.0. Three answers, and the
+company that published it no longer exists.
+
+Nothing here redistributes that voice - the install step downloads it from
+HuggingFace - and any piper voice works: set `voice` in the config. If the
+licence of the voice matters to you, pick one whose terms you can actually read.
+
+This section is a survey of what upstreams state about themselves, not legal
+advice. If this project carries commercial exposure for you, have someone
+qualified look at it.
+
 ## License
 
 [MIT](LICENSE), copyright Cloud First Consulting. Use it, change it, ship it,
