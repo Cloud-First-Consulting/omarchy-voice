@@ -140,19 +140,51 @@ def find_wake_model(name):
     sys.exit(f"No wake model {name}.onnx found under {WAKE_DIR}")
 
 
-def mic_has_signal(name, seconds=0.4):
-    """A built-in device can exist and capture pure silence; probe before trusting it."""
+# Where the best built-in microphone found so far is remembered, so a silent
+# room does not have to work it out from nothing. See pick_builtin_mic().
+KNOWN_GOOD_MIC = pathlib.Path.home() / ".local/share/omarchy/voice-mic-known-good"
+
+# A level this far above the quietest candidate means one of them is hearing the
+# room and the other is not. Chosen from measurement rather than taste: on the
+# machine this was written on, an unwired analog input sits at an RMS near 38
+# while the wired digital array reads in the hundreds when anyone speaks.
+SIGNAL_RATIO = 4.0
+SIGNAL_FLOOR = 120.0  # RMS; below this every candidate is just its own noise
+
+
+def mic_level(name, seconds=0.6):
+    """Mean level of a short capture. Higher means it is hearing more."""
     proc = recorder(name)
     try:
         data = proc.stdout.read(int(RATE * 2 * seconds))
     finally:
         proc.kill()
-    return peak(data or b"") > 50
+    samples = array.array("h")
+    raw = data or b""
+    samples.frombytes(raw[: len(raw) - (len(raw) % 2)])
+    if not samples:
+        return 0.0
+    # RMS rather than peak. Peak is what the previous version tested, and an
+    # unwired input's electrical noise peaked at around 218 here - four times
+    # the threshold it was tested against, so a deaf device passed for "hearing
+    # something" and won on priority every time. A mean is not fooled by a
+    # single spike.
+    return (sum(s * s for s in samples) / len(samples)) ** 0.5
 
 
-def default_mic():
-    """Built-in capture device that actually hears something, so Bluetooth
-    headsets stay on A2DP and a dead input never silently wins."""
+def pick_builtin_mic():
+    """Built-in capture device most likely to actually hear you.
+
+    PipeWire's ranking says nothing about which jack is wired. On this machine
+    it puts an analog input nobody has connected anything to (priority 2000)
+    above the digital array that works (1648), and the listener spent hours on
+    the deaf one - awake, streaming, and unable to hear a wake word.
+
+    So every candidate is probed rather than only the highest ranked, and they
+    are judged against each other rather than against a fixed number, because
+    what separates a live microphone from a dead one is the difference between
+    them, not an absolute.
+    """
     try:
         dump = json.loads(subprocess.run(["pw-dump"], capture_output=True, text=True).stdout)
     except (json.JSONDecodeError, OSError):
@@ -162,12 +194,39 @@ def default_mic():
         props = (obj.get("info") or {}).get("props") or {}
         if props.get("media.class") == "Audio/Source" and str(props.get("node.name", "")).startswith("alsa_input"):
             builtin.append((props.get("priority.session", 0), props["node.name"]))
-    # Highest session priority first, but a device that captures silence loses
-    # to one that doesn't — PipeWire's ranking has no idea which jack is wired.
-    for _, name in sorted(builtin, reverse=True):
-        if mic_has_signal(name):
-            return name
-    return max(builtin)[1] if builtin else ""
+    if not builtin:
+        return ""
+    by_priority = [name for _, name in sorted(builtin, reverse=True)]
+    if len(by_priority) == 1:
+        return by_priority[0]
+
+    levels = {name: mic_level(name) for name in by_priority}
+    best = max(levels, key=lambda n: levels[n])
+    quietest = min(levels.values())
+    # One of them is clearly hearing the room: trust it and remember it.
+    if levels[best] >= SIGNAL_FLOOR and levels[best] >= max(quietest, 1.0) * SIGNAL_RATIO:
+        try:
+            KNOWN_GOOD_MIC.parent.mkdir(parents=True, exist_ok=True)
+            KNOWN_GOOD_MIC.write_text(best + "\n")
+        except OSError:
+            pass
+        return best
+
+    # Nobody is hearing anything, which in a quiet room says nothing about which
+    # microphone is wired. Prefer whichever one was last seen working, since a
+    # device that has heard the room before is a better guess than a ranking
+    # that has never listened to it.
+    try:
+        remembered = KNOWN_GOOD_MIC.read_text().strip()
+    except OSError:
+        remembered = ""
+    if remembered in levels:
+        return remembered
+    return by_priority[0]
+
+
+def default_mic():
+    return pick_builtin_mic()
 
 
 def recorder(mic):

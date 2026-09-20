@@ -453,6 +453,21 @@ only against the turn before it; filed under that phrase and replayed cold, it
 would act on whatever happened to be open. Plans that used context are never
 learned.
 
+**A device that exists is not a device that is wired.** This laptop's codec
+offers two built-in inputs. PipeWire ranks the analog one highest - priority
+2000 against 1648 - and nothing is connected to it. The guard against that was
+already here, and it was calibrated wrong: it rejected a microphone whose *peak*
+stayed under 50, while the unwired input's own electrical noise peaks around
+218. So the dead input passed for "hearing something" and won on rank, and the
+listener spent hours awake, streaming, and unable to hear a wake word.
+
+Candidates are now all probed rather than just the highest ranked, judged on
+mean level rather than peak, and compared against each other rather than against
+a number - what separates a live microphone from a dead one is the difference
+between them. Measured here: 2412 against 38. The winner is remembered, because
+in a silent room no amount of listening can tell you which jack is wired, and
+what worked before is a better guess than a ranking that has never listened.
+
 **Checks that cry wolf are worse than no checks.** Two had to be fixed: a test
 asserting against a runtime file whose contents changed under it, and a health
 check reporting a working microphone fallback as a hard failure. Both would have
