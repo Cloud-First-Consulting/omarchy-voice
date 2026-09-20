@@ -4,6 +4,10 @@ An always-on voice assistant for Omarchy (Arch + Hyprland + PipeWire). Say
 "Hey Marvin", then a command. Everything runs locally except the fallback that
 works out what an unrecognised sentence meant.
 
+There is a longer write-up of how it works, what it is used for and what went
+wrong along the way:
+[Omarchy Voice: An Open-Source Voice Assistant for Omarchy Linux](https://cloudfirstconsulting.com/insights/omarchy-voice-assistant).
+
 ```
 "Hey Marvin"  ─▶ openWakeWord ─▶ record ─▶ whisper ─▶ phrase table ─▶ act
                  (neural,          (with     (voxtype)      │           │
