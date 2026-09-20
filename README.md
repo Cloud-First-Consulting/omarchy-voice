@@ -138,6 +138,15 @@ The model itself needs no separate download: `hey_marvin_v0.1.onnx` ships
 inside the openwakeword wheel, together with the mel and embedding models it
 runs on top of. `scipy` is used only by the test harness, to resample.
 
+Acting inside a web page additionally needs `websockets`, on the *system*
+Python rather than in that virtualenv, because `omarchy-browser-control` talks
+to Chromium over the DevTools Protocol:
+
+    sudo pacman -S python-websockets
+
+Everything else works without it; only "click the accept button" and its
+siblings stop working.
+
 The listener re-execs itself into this virtualenv when it was started by the
 system interpreter, so it still runs by hand and from a keybinding.
 
@@ -316,6 +325,7 @@ appearing.
     bin/omarchy-voice-diagnose     probes the machine, then explains what broke
     bin/omarchy-voice-reference    builds that answer's source from the live system
     bin/omarchy-voice-browser      a Chromium profile voice is allowed to drive
+    bin/omarchy-browser-control    acts inside that page: click, type, dismiss
     bin/omarchy-voice-wake-test    detector regression suite, scores real audio
     bin/omarchy-voice-wake-check   post-boot health check
     bin/omarchy-voice-wake-toggle  start/stop, for a keybinding

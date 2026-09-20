@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""Control the page in the browser by voice: click things, fill fields, dismiss dialogs.
+
+Launching a browser is easy; acting inside one needs to know what is on the page.
+This reads the interactive elements out of the live tab over the Chrome DevTools
+Protocol, lets a model pick which one the sentence meant, and acts on that element
+directly - no screen coordinates, so it does not care where the window sits or
+whether the page is scrolled.
+
+    omarchy-browser-control "click the sign in button"
+    omarchy-browser-control "type my email in the email field"
+    omarchy-browser-control "close the cookie dialog"
+    omarchy-browser-control --list        # what the page offers right now
+
+Requires Chromium started with --remote-debugging-port, which is what
+omarchy-voice-browser does; both take the port from OMARCHY_CDP_PORT and default
+to 9222. CDP listens on loopback only, but any local process can drive the
+browser through it - that is the tradeoff this feature makes.
+
+Reached only from the phrase table, on a sentence the user actually spoke -
+"click the accept button", "dismiss the cookie banner". Deliberately NOT on
+omarchy-voice-plan's allowlist: the planner is told the titles of open windows,
+a web page sets its own title, and a title claiming a click was required talked
+the planner into performing one. Nothing a model is *told* should be able to
+reach into a page.
+"""
+
+import asyncio
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import urllib.request
+
+# resolve() follows the symlink from ~/.local/bin back into the repo, so the
+# shared module is found however this was invoked.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib"))
+import omarchy_voice_agent as agent  # noqa: E402
+
+PORT = int(os.environ.get("OMARCHY_CDP_PORT", "9222"))
+MODEL = os.environ.get("OMARCHY_VOICE_MODEL", "haiku")
+
+# Collect what a person could actually interact with, in document order, and keep
+# a handle to each so the chosen one can be acted on without re-querying.
+COLLECT_JS = r"""
+(() => {
+  const sel = 'a,button,input,textarea,select,summary,[role=button],[role=link],' +
+              '[role=textbox],[role=checkbox],[role=tab],[onclick],[contenteditable=true]';
+  const vis = (e) => {
+    const r = e.getBoundingClientRect(), s = getComputedStyle(e);
+    return r.width > 1 && r.height > 1 && s.visibility !== 'hidden' &&
+           s.display !== 'none' && s.opacity !== '0';
+  };
+  const els = Array.from(document.querySelectorAll(sel)).filter(vis);
+  window.__voiceEls = els;
+  return JSON.stringify({
+    title: document.title,
+    url: location.href,
+    elements: els.slice(0, 120).map((e, i) => ({
+      i,
+      tag: e.tagName.toLowerCase(),
+      type: e.getAttribute('type') || '',
+      text: (e.innerText || e.value || e.placeholder ||
+             e.getAttribute('aria-label') || e.title || '').replace(/\s+/g, ' ').trim().slice(0, 70),
+      name: (e.getAttribute('name') || e.id || '').slice(0, 30),
+    })),
+  });
+})()
+"""
+
+PROMPT = """\
+You are operating a web page for someone who spoke a request out loud.
+
+Page: {title}
+URL: {url}
+
+Interactive elements (index, tag, type, visible text, name/id):
+{elements}
+
+Their request: {text}
+
+Reply with ONE JSON object, nothing else:
+
+  {{"action": "click", "index": <n>, "say": "<3-5 words>"}}
+  {{"action": "type", "index": <n>, "value": "<text to enter>", "enter": true|false, "say": "..."}}
+  {{"action": "key", "key": "Escape"|"Enter"|"PageDown"|"PageUp", "say": "..."}}
+  {{"action": "scroll", "amount": <pixels, negative for up>, "say": "..."}}
+  {{"action": "back", "say": "..."}}
+  {{"action": "none", "say": "<why you cannot do it>"}}
+
+Pick the element whose text best matches what they described; speech transcription
+is imperfect, so match loosely. To dismiss a cookie banner or dialog, prefer a
+visible accept/close/dismiss button over the Escape key. Use "none" if nothing on
+the page plausibly matches.\
+"""
+
+
+def notify(title, body, icon="\U000f05a6", timeout=5000):
+    subprocess.run(["omarchy-notification-send", "-g", icon, title, body, "-t", str(timeout)],
+                   check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def active_page():
+    """The frontmost page target. CDP lists most-recently-used first."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{PORT}/json/list", timeout=3) as response:
+            targets = json.load(response)
+    except OSError:
+        return None
+    pages = [t for t in targets
+             if t.get("type") == "page" and not t.get("url", "").startswith("devtools://")]
+    return pages[0] if pages else None
+
+
+class Session:
+    def __init__(self, ws):
+        self.ws = ws
+        self.n = 0
+
+    async def call(self, method, **params):
+        self.n += 1
+        await self.ws.send(json.dumps({"id": self.n, "method": method, "params": params}))
+        while True:
+            message = json.loads(await self.ws.recv())
+            if message.get("id") == self.n:
+                if "error" in message:
+                    raise RuntimeError(message["error"].get("message", "CDP error"))
+                return message.get("result", {})
+
+    async def js(self, expression):
+        result = await self.call("Runtime.evaluate", expression=expression,
+                                 returnByValue=True, awaitPromise=True)
+        return result.get("result", {}).get("value")
+
+    async def press(self, key):
+        codes = {"Escape": (27, "Escape"), "Enter": (13, "Enter"),
+                 "PageDown": (34, "PageDown"), "PageUp": (33, "PageUp")}
+        code, name = codes.get(key, (13, "Enter"))
+        for kind in ("keyDown", "keyUp"):
+            await self.call("Input.dispatchKeyEvent", type=kind, windowsVirtualKeyCode=code,
+                            nativeVirtualKeyCode=code, key=name, code=name)
+
+
+def ask_model(page, elements, text):
+    listing = "\n".join(
+        f"{e['i']:>3}  {e['tag']}{('/' + e['type']) if e['type'] else ''}  "
+        f"{e['text'] or '(no text)'}  {('[' + e['name'] + ']') if e['name'] else ''}"
+        for e in elements
+    )
+    prompt = PROMPT.format(title=page["title"], url=page["url"], elements=listing, text=text)
+    result, error = agent.ask(prompt, model=MODEL, timeout=60)
+    if error:
+        return None
+    result = re.sub(r"^```(?:json)?|```$", "", result.strip(), flags=re.M).strip()
+    match = re.search(r"\{.*\}", result, re.S)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+
+
+async def run(text, list_only):
+    import websockets
+
+    target = active_page()
+    if not target:
+        notify("No browser to control",
+               f"Start Chromium with the CDP wrapper (port {PORT})", "\U000f0028")
+        return
+
+    async with websockets.connect(target["webSocketDebuggerUrl"],
+                                  max_size=8 * 1024 * 1024) as ws:
+        session = Session(ws)
+        await session.call("Runtime.enable")
+        raw = await session.js(COLLECT_JS)
+        page = json.loads(raw) if raw else {"title": "", "url": "", "elements": []}
+
+        if list_only:
+            print(f"{page['title']}  -  {page['url']}")
+            for e in page["elements"]:
+                print(f"{e['i']:>3}  {e['tag']:<9} {e['text'][:60]:<60} {e['name']}")
+            return
+
+        if not page["elements"]:
+            notify("Nothing to click", "No interactive elements on this page", "\U000f0028")
+            return
+
+        plan = ask_model(page, page["elements"], text)
+        if not plan:
+            notify("Couldn't work that out", f"“{text}”", "\U000f0028")
+            return
+
+        action = plan.get("action")
+        say = str(plan.get("say", "")).strip() or text
+        index = plan.get("index")
+
+        if action == "none":
+            notify("Can't do that here", say, "\U000f0028", 8000)
+            return
+
+        if action == "click":
+            await session.js(f"""(() => {{
+                const el = window.__voiceEls[{int(index)}];
+                if (!el) return false;
+                el.scrollIntoView({{block: 'center'}});
+                el.click();
+                return true;
+            }})()""")
+        elif action == "type":
+            value = str(plan.get("value", ""))
+            await session.js(f"""(() => {{
+                const el = window.__voiceEls[{int(index)}];
+                if (!el) return false;
+                el.scrollIntoView({{block: 'center'}});
+                el.focus();
+                return true;
+            }})()""")
+            # insertText goes through the browser's input pipeline, so frameworks
+            # that listen for real events (React, Vue) see the value change.
+            await session.call("Input.insertText", text=value)
+            if plan.get("enter"):
+                await session.press("Enter")
+        elif action == "key":
+            await session.press(str(plan.get("key", "Escape")))
+        elif action == "scroll":
+            await session.js(f"window.scrollBy(0, {int(plan.get('amount', 400))})")
+        elif action == "back":
+            await session.js("history.back()")
+        else:
+            notify("Couldn't work that out", f"“{text}”", "\U000f0028")
+            return
+
+        notify(say, f"“{text}”", "\U000f012c")
+
+
+def main():
+    args = [a for a in sys.argv[1:] if a != "--list"]
+    list_only = "--list" in sys.argv[1:]
+    text = " ".join(args).strip()
+    if not text and not list_only:
+        sys.exit('usage: omarchy-browser-control "click the sign in button" | --list')
+    asyncio.run(run(text, list_only))
+
+
+if __name__ == "__main__":
+    main()
