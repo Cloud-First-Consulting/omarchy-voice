@@ -42,10 +42,13 @@ document, you have just created something that goes stale silently.
 
 ## There is also a skill, for agents not working in this repo
 
-`skills/omarchy-hotkeys/` is linked by `install.sh` into `~/.agents/skills`,
-`~/.claude/skills` and `~/.codex/skills` - whichever exist. `~/.agents/skills`
-is Omarchy's agent-agnostic location, so the answer to "what key does this" does
-not depend on which coding agent is running.
+`skills/omarchy-hotkeys/` is linked by `install.sh --skills <tools>` into
+`~/.agents/skills`, `~/.claude/skills` and/or `~/.codex/skills`, only for the
+tools named and only where the directory already exists. It is opt-in: a plain
+`./install.sh` installs no skill, and an existing skill of the same name that
+is not ours is never replaced. `~/.agents/skills` is Omarchy's agent-agnostic
+location, so the answer to "what key does this" does not depend on which coding
+agent is running.
 
 This file only applies to an agent working *in this repo*. The skill applies
 anywhere on the machine, which is where the question usually gets asked.

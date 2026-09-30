@@ -187,8 +187,6 @@ clone. Either way there is one copy.
 `install.sh`:
 
 - symlinks `bin/*` into `~/.local/bin`
-- links `skills/*` into whichever of `~/.agents/skills`, `~/.claude/skills` and
-  `~/.codex/skills` already exist
 - makes sure `~/.config/omarchy/plugins/omarchy-voice.marvin` is this clone,
   and prints the command to put the icon in your bar
 - installs and enables the user unit
@@ -196,8 +194,22 @@ clone. Either way there is one copy.
   already have one
 
 It never overwrites an existing config, because that file names your
-microphone. If anything above is missing it says which and stops rather than
-starting something that cannot work.
+microphone, and it never replaces a file or link it did not make: a same-named
+entry that points somewhere else is left alone and reported. If anything above
+is missing it says which and stops rather than starting something that cannot
+work.
+
+The agent skill in `skills/omarchy-hotkeys/` is not installed unless you ask.
+It teaches a coding agent to answer "what key does X" from this machine's live
+bindings rather than from memory. Opt in per tool:
+
+    ./install.sh --skills claude          # ~/.claude/skills
+    ./install.sh --skills agents,codex    # ~/.agents/skills and ~/.codex/skills
+    ./install.sh --skills all             # every one of those that exists
+
+A directory that does not exist is skipped, never created, and an existing
+skill of the same name that is not ours is kept. `~/.agents/skills` is the
+agent-agnostic location several tools read.
 
 Symlinks rather than copies, so editing the clone edits the running system.
 Keep the clone somewhere permanent - moving it breaks the links until you run
@@ -248,9 +260,9 @@ room where you would rather not leave a microphone open.
     omarchy plugin remove omarchy-voice.marvin --yes    # if `omarchy plugin add` made the clone
 
 `uninstall.sh` stops and disables the listener, removes the user unit, takes
-the icon out of the bar, and removes every link `install.sh` made - and only
-links that point into this clone, so a same-named script from somewhere else
-is left alone. Your config and what it has learned stay unless you pass
+the icon out of the bar, and removes every link `install.sh` made, including
+any skill links - and only links that point into this clone, so a same-named
+script or skill from somewhere else is left alone. Your config and what it has learned stay unless you pass
 `--purge`, which also removes `~/.config/omarchy/voice-wake.json`, the learned
 phrase cache and the cached Omarchy reference.
 
@@ -471,7 +483,7 @@ places - one is a room full of people, the other is a meeting.
     lib/omarchy_voice_ui.py        the animated progress notification, shared
     lib/omarchy_voice_agent.py     which coding agent answers, and how to ask it
     AGENTS.md                      notes for a coding agent working on this repo
-    skills/omarchy-hotkeys/        so any agent answers key questions from this machine
+    skills/omarchy-hotkeys/        so any agent answers key questions from this machine (opt-in)
     systemd/                       the user unit
     config/                        example config; the live one is untracked
 
