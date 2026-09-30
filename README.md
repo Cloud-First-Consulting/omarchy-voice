@@ -171,17 +171,26 @@ piper voice works; put its name in `voice` in the config.
 
 ### 3. This repo
 
-    git clone https://github.com/Cloud-First-Consulting/omarchy-voice.git
-    cd omarchy-voice
+The repo is also the Omarchy plugin: `manifest.json` and the bar widget sit at
+its root, so Omarchy's plugin manager can fetch it directly.
+
+    omarchy plugin add https://github.com/Cloud-First-Consulting/omarchy-voice.git --yes
+    cd ~/.config/omarchy/plugins/omarchy-voice.marvin
     ./install.sh
+
+That clones it into `~/.config/omarchy/plugins/omarchy-voice.marvin`, and
+`omarchy plugin update omarchy-voice.marvin` later pulls new commits. If you
+would rather keep the clone somewhere of your own choosing, `git clone` it there
+and run `./install.sh` from it; the plugin directory is then a link to your
+clone. Either way there is one copy.
 
 `install.sh`:
 
 - symlinks `bin/*` into `~/.local/bin`
 - links `skills/*` into whichever of `~/.agents/skills`, `~/.claude/skills` and
   `~/.codex/skills` already exist
-- links `plugins/*` into `~/.config/omarchy/plugins/` by the id in each
-  manifest, and prints the command to enable it
+- makes sure `~/.config/omarchy/plugins/omarchy-voice.marvin` is this clone,
+  and prints the command to put the icon in your bar
 - installs and enables the user unit
 - creates `~/.config/omarchy/voice-wake.json` from the example if you do not
   already have one
@@ -198,7 +207,7 @@ Keep the clone somewhere permanent - moving it breaks the links until you run
 
     omarchy plugin enable omarchy-voice.marvin right
 
-Linking a plugin makes it available; it does not put it in your bar, because
+Adding a plugin makes it available; it does not put it in your bar, because
 where things sit in your bar is your decision. `left` and `center` work too.
 
 The icon is a figure speaking, deliberately not a microphone: Omarchy's own
@@ -231,6 +240,26 @@ o.bind("SUPER + ALT + M", "Marvin panel", "omarchy-shell omarchy-voice.marvin to
 
 Push-to-talk is the same dispatcher without the wake word, which is useful in a
 room where you would rather not leave a microphone open.
+
+### Removing it
+
+    cd ~/.config/omarchy/plugins/omarchy-voice.marvin   # or wherever the clone is
+    ./uninstall.sh
+    omarchy plugin remove omarchy-voice.marvin --yes    # if `omarchy plugin add` made the clone
+
+`uninstall.sh` stops and disables the listener, removes the user unit, takes
+the icon out of the bar, and removes every link `install.sh` made - and only
+links that point into this clone, so a same-named script from somewhere else
+is left alone. Your config and what it has learned stay unless you pass
+`--purge`, which also removes `~/.config/omarchy/voice-wake.json`, the learned
+phrase cache and the cached Omarchy reference.
+
+The two pieces installed by hand in steps 1 and 2 are removed by hand:
+
+    rm -rf ~/.local/share/omarchy-wakeword ~/.local/share/piper
+
+Keybindings you added yourself are yours to remove. Nothing in `~/.config/hypr`
+is ever touched.
 
 ## Using it
 
@@ -435,7 +464,7 @@ places - one is a room full of people, the other is a meeting.
     bin/omarchy-browser-control    acts inside that page: click, type, dismiss
     bin/omarchy-voice-audio        which microphone it hears on, which speaker it answers through
     bin/omarchy-voice-autostart    whether it comes back after a reboot
-    plugins/marvin/                the bar widget: state, and one click to change either
+    manifest.json, Panel.qml       the bar widget, at the root so the repo is the plugin
     bin/omarchy-voice-wake-test    detector regression suite, scores real audio
     bin/omarchy-voice-wake-check   post-boot health check
     bin/omarchy-voice-wake-toggle  start/stop, for a keybinding
@@ -447,7 +476,8 @@ places - one is a room full of people, the other is a meeting.
     config/                        example config; the live one is untracked
 
 `~/.local/bin/omarchy-voice-*` are symlinks into `bin/`, so editing the repo
-edits the running system. `install.sh` recreates those links on a new machine.
+edits the running system. `install.sh` recreates those links on a new machine;
+`uninstall.sh` removes them.
 
 ## Things that were learned the hard way
 

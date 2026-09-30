@@ -50,20 +50,27 @@ for skill in "$REPO"/skills/*/; do
   done
 done
 
-# Shell plugins, linked the same way. Only into a directory that already
-# exists, so this never creates a plugin folder on a machine whose shell does
-# not use one. The shell picks the change up on its own; `omarchy restart shell`
-# forces it.
+# The bar widget. This repo *is* the plugin: manifest.json and Panel.qml sit at
+# the root, so `omarchy plugin add <repo-url>` clones it straight into
+# ~/.config/omarchy/plugins/<id>, and this script is then run from there. When
+# it is run from a clone kept somewhere else, the plugin directory is linked to
+# that clone instead - the same one-copy rule as the scripts above. Linking
+# makes it discoverable; it never puts it in your bar, which is your decision.
+# (`omarchy plugin validate` on the link reports the link itself; validate the
+# clone. `omarchy plugin add` validates a real checkout, so that is unaffected.)
 PLUGIN_DIR="$HOME/.config/omarchy/plugins"
-for plugin in "$REPO"/plugins/*/; do
-  [[ -f $plugin/manifest.json ]] || continue
-  id=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['id'])" "$plugin/manifest.json" 2>/dev/null) || continue
-  [[ -n $id ]] || continue
-  mkdir -p "$PLUGIN_DIR"
-  ln -sfn "${plugin%/}" "$PLUGIN_DIR/$id"
-  echo "  linked plugin $id"
-  echo "    enable it with: omarchy plugin enable $id right"
-done
+id=$(jq -r '.id' "$REPO/manifest.json")
+if [[ $(readlink -f "$PLUGIN_DIR/$id" 2>/dev/null) != "$REPO" ]]; then
+  if [[ -e $PLUGIN_DIR/$id && ! -L $PLUGIN_DIR/$id ]]; then
+    echo "  $PLUGIN_DIR/$id already exists and is not a link; leaving it alone"
+    echo "    (remove it with: omarchy plugin remove $id)"
+  else
+    mkdir -p "$PLUGIN_DIR"
+    ln -sfn "$REPO" "$PLUGIN_DIR/$id"
+    echo "  linked plugin $id"
+  fi
+fi
+echo "    enable the bar icon with: omarchy plugin enable $id right"
 
 # Never overwrite a real config: it names this machine's microphone.
 if [[ ! -f $CONFIG ]]; then
