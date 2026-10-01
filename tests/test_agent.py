@@ -17,12 +17,7 @@ import omarchy_voice_agent as agent  # noqa: E402
 REQUIRED = {
     "claude": [("--tools", ""), ("--strict-mcp-config",), ("--setting-sources", ""),
                ("--max-turns", "1")],
-    "copilot": [("--deny-tool", "shell"), ("--deny-tool", "write"),
-                ("--deny-tool", "url"), ("--disable-builtin-mcps",)],
     "gemini": [("--policy", str(agent.GEMINI_POLICY))],
-    "codex": [("--sandbox", "read-only")],
-    "cursor-agent": [("--mode", "plan"), ("--sandbox", "enabled")],
-    "grok": [("--tools", ""), ("--permission-mode", "plan"), ("--max-turns", "1")],
     "opencode": [("--dir",)],
 }
 
@@ -72,9 +67,11 @@ class ToolFree(unittest.TestCase):
         self.assertTrue(agent.OPENCODE_NO_TOOLS["tools"])
         self.assertFalse(any(agent.OPENCODE_NO_TOOLS["tools"].values()))
 
-    def test_crush_is_not_an_engine(self):
-        self.assertIn("crush", agent.UNSUPPORTED)
-        self.assertNotIn("crush", agent.ADAPTERS)
+    def test_read_only_is_not_tool_free(self):
+        for name in ("crush", "codex", "cursor-agent", "grok", "copilot"):
+            with self.subTest(agent=name):
+                self.assertIn(name, agent.UNSUPPORTED)
+                self.assertNotIn(name, agent.ADAPTERS)
 
 
 if __name__ == "__main__":

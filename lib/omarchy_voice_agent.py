@@ -20,10 +20,17 @@ Both live in the table below:
   verified  whether that was confirmed by asking it to use a tool and
             watching it fail, on a logged-in install of that CLI
 
-An agent whose CLI offers no documented way to withhold its tools is not in
-the table. It still works for "ask the agent to ..." - that is a deliberate
-handoff through `omarchy agent prompt`, started only on a sentence the user
-spoke - but it cannot be the engine behind the planner or the manual, and
+"Read-only" is not enough. A sandbox that still lets the agent read files
+lets injected text pull a private file into the model's context, and the
+model's reply is spoken aloud and written to a cache. So an agent is in the
+table only when its CLI has a documented way to leave it with *no* tools,
+reads included. codex's read-only sandbox, cursor-agent's plan mode and
+grok's plan mode all keep file reads; grok's --tools "" is not documented
+as "none"; crush has no such flag at all; and copilot, with every tool it
+lists excluded and url access denied, still fetched a web page when asked
+to. None of those is an engine here.
+They still work for "ask the agent to ..." - a deliberate handoff through
+`omarchy agent prompt`, started only on a sentence the user spoke - and
 `claude` answers instead when it is installed, with a note saying so.
 
 Every agent also runs from an empty runtime directory rather than $HOME, so
@@ -72,18 +79,6 @@ ADAPTERS = {
         "access": "no tools",
         "verified": True,
     },
-    # Denial rules take precedence over everything in copilot, including
-    # --allow-all-tools; shell(), write() and url() without an argument match
-    # every shell command, every file write and every URL. Built-in MCP
-    # servers are off. The same two probes answered "NO TOOLS".
-    "copilot": {
-        "argv": lambda p, m: ["copilot", "-p", p, "-s",
-                              "--deny-tool", "shell", "--deny-tool", "write",
-                              "--deny-tool", "url", "--disable-builtin-mcps"],
-        "envelope": "text",
-        "access": "no shell, no writes, no network, no MCP",
-        "verified": True,
-    },
     # opencode merges the project config in its working directory over the
     # user's; OPENCODE_NO_TOOLS is written there before every call. The
     # `tools` map is documented in opencode's config schema. Not probed: the
@@ -107,44 +102,21 @@ ADAPTERS = {
         "access": "no tools (policy)",
         "verified": False,
     },
-    # Read-only sandbox: the shell tool exists but may not write or reach the
-    # network. --skip-git-repo-check because exec refuses to run outside a
-    # directory it trusts. Flags verified to parse; no OpenAI account here.
-    "codex": {
-        "argv": lambda p, m: ["codex", "exec", "--skip-git-repo-check",
-                              "--sandbox", "read-only", p],
-        "envelope": "text",
-        "access": "read-only sandbox",
-        "verified": False,
-    },
-    # plan mode is documented as read-only; the sandbox is turned on as well.
-    # Flags verified to parse; no Cursor account here.
-    "cursor-agent": {
-        "argv": lambda p, m: ["cursor-agent", "-p", "--mode", "plan",
-                              "--sandbox", "enabled", p],
-        "envelope": "text",
-        "access": "read-only (plan mode)",
-        "verified": False,
-    },
-    # --tools takes the built-in tools to allow, and is given none; plan mode
-    # is read-only on top; no web search, no subagents, one turn. Flags
-    # verified to parse; no xAI account here.
-    "grok": {
-        "argv": lambda p, m: ["grok", "-p", p, "--tools", "",
-                              "--permission-mode", "plan",
-                              "--disable-web-search", "--no-subagents",
-                              "--max-turns", "1"],
-        "envelope": "text",
-        "access": "no tools (plan mode)",
-        "verified": False,
-    },
 }
 
-# Agents Omarchy can launch but which cannot answer here. pi, omp, openclaw,
-# hermes and muse have no one-shot mode. crush has one, but no documented way
-# to withhold its tools from it, and Omarchy's own launcher notes that
-# `crush run` never prompts - which is the opposite of what this path needs.
-UNSUPPORTED = {"pi", "omp", "openclaw", "hermes", "muse", "crush"}
+# Agents Omarchy can launch but which cannot answer here, and why.
+UNSUPPORTED = {
+    "pi": "has no one-shot mode",
+    "omp": "has no one-shot mode",
+    "openclaw": "has no one-shot mode",
+    "hermes": "has no one-shot mode",
+    "muse": "has no one-shot mode",
+    "crush": "has no way to be asked without its tools",
+    "copilot": "still reaches the network with every tool excluded and url denied",
+    "codex": "keeps file reads and a shell even in its read-only sandbox",
+    "cursor-agent": "keeps file reads in plan mode, and has no tool-free mode",
+    "grok": "keeps file reads in plan mode, and --tools \"\" is not documented as none",
+}
 
 # Flags that would hand an agent its tools back. Nothing in ADAPTERS may
 # contain one; tests/test_agent.py checks.
@@ -198,13 +170,13 @@ def resolve():
         if not chosen:
             return "claude", ""
         if chosen in UNSUPPORTED:
-            return "claude", f"{chosen} cannot be asked without its tools; answered with claude"
+            return "claude", f"{chosen} {UNSUPPORTED[chosen]}; answered with claude"
         if chosen not in ADAPTERS:
             return "claude", f"{chosen} is not known here; answered with claude"
         return "claude", f"{chosen} is not installed; answered with claude"
 
     if chosen in UNSUPPORTED:
-        return None, f"{chosen} cannot be asked a single question without its tools, and claude is not installed"
+        return None, f"{chosen} {UNSUPPORTED[chosen]}, and claude is not installed"
     if chosen and chosen not in ADAPTERS:
         return None, f"{chosen} is not one of the agents this can ask"
     if not chosen:

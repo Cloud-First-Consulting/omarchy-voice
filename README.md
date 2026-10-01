@@ -114,16 +114,17 @@ Two more:
 and a coding agent, which the two fallback tiers and the Omarchy manual call.
 Whichever one Omarchy is set to use is the one that answers:
 
-    omarchy default agent codex        # or claude, opencode, copilot, ...
+    omarchy default agent claude       # or gemini, opencode; the rest fall back to claude
 
-Seven of the agents Omarchy supports can answer a single question without a
-terminal *and without their tools*, and are used directly: **claude, codex,
-gemini, opencode, cursor-agent, copilot** and **grok**. The agent is only ever
-asked for words; see [The agent has no hands](#the-agent-has-no-hands). The
-other six - pi, omp, openclaw, hermes and muse have no one-shot mode, and
-crush has no documented way to withhold its tools from one - cannot be the
-engine here, so if one of those is your default the manual falls back to
-`claude` when it is installed and says so. Handing work off with "ask the
+Three of the agents Omarchy supports can answer a single question without a
+terminal *and without their tools*, and are used directly: **claude, gemini**
+and **opencode**. The agent is only ever asked for words; see [The agent has
+no hands](#the-agent-has-no-hands). The other ten cannot be the engine here -
+pi, omp, openclaw, hermes and muse have no one-shot mode; codex, cursor-agent
+and grok keep file reads in their most restricted modes; crush has no
+restricted mode; copilot could not be shown to lose the network - so if one
+of those is your default the manual falls back to `claude` when it is
+installed and says so. Handing work off with "ask the
 agent to ..." works with all thirteen either way, because that is a
 deliberate, interactive launch through `omarchy agent`, which Omarchy maps
 itself.
@@ -614,20 +615,20 @@ instructions either. The reply is the only thing it can produce.
 | agent | how | leaves it able to | checked |
 |---|---|---|---|
 | claude | `--tools ""`, `--strict-mcp-config`, `--setting-sources ""` | nothing | asked to run `id` and to read a file: "NO TOOLS" to both |
-| copilot | `--deny-tool shell`, `write`, `url`; `--disable-builtin-mcps` | nothing that touches the machine | same two probes, same answer |
-| opencode | a project config in its working directory with every tool `false` | nothing | config key is documented; the free tier here refuses tool-less requests, so not probed |
-| gemini | `--policy config/gemini-no-tools.toml`, a deny-all rule | nothing | flags parse; no account here to probe |
-| codex | `--sandbox read-only` | read files, no writes, no network | flags parse; no account here |
-| cursor-agent | `--mode plan --sandbox enabled` | read-only | flags parse; no account here |
-| grok | `--tools ""`, `--permission-mode plan`, no web, no subagents | nothing | flags parse; no account here |
+| gemini | `--policy config/gemini-no-tools.toml`, a `toolName = "*"` deny rule | nothing | the policy engine documents `*` as every tool; no account here to probe |
+| opencode | a project config in its working directory with every tool `false` | nothing | the `tools` map is documented; the free tier here refuses tool-less requests, so not probed |
 
-Those flags were each read out of the CLI's own `--help`; the ones marked as
-probed were confirmed by asking the agent to use a tool and watching it say it
-could not. Under the previous invocation Claude answered the same probe by
-*calling Bash* - which is what the review of this project caught, and why the
-table exists. `crush run` has no documented way to be asked without its tools,
-so it is not an engine here; the user's choice of crush for everything else
-is unaffected.
+Those flags were each read out of the CLI's own documentation, and claude's
+were confirmed by asking it to use a tool and watching it say it could not.
+Under the previous invocation Claude answered the same probe by *calling
+Bash* - which is what the review of this project caught, and why the table
+exists. "Read-only" does not qualify: a sandbox that still reads files lets a
+forged title pull a private file into the model's context, and the reply is
+spoken and cached. So codex (read-only sandbox keeps reads and a shell),
+cursor-agent and grok (plan mode keeps reads), crush (no restricted mode) and
+copilot (with every tool it lists excluded and url access denied, it still
+fetched a web page when asked) are not engines here. `tests/test_agent.py`
+keeps it that way.
 
 ### One boundary, by shape
 
