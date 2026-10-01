@@ -114,17 +114,18 @@ Two more:
 and a coding agent, which the two fallback tiers and the Omarchy manual call.
 Whichever one Omarchy is set to use is the one that answers:
 
-    omarchy default agent claude       # or opencode; the rest fall back to claude
+    omarchy default agent claude       # any other choice falls back to claude here
 
-Two of the agents Omarchy supports can answer a single question without a
-terminal *and without their tools*, and are used directly: **claude** and
-**opencode**. The agent is only ever asked for words; see [The agent has no
-hands](#the-agent-has-no-hands). The other eleven cannot be the engine here -
-pi, omp, openclaw, hermes and muse have no one-shot mode; codex, cursor-agent
-and grok keep file reads in their most restricted modes; crush has no
-restricted mode; copilot could not be shown to lose the network; gemini's
-deny-all policy could not be checked - so if one of those is your default the
-manual falls back to `claude` when it is installed and says so. Handing work off with "ask the
+One of the agents Omarchy supports can answer a single question without a
+terminal *and without its tools*, and is used directly: **claude**. The agent
+is only ever asked for words; see [The agent has no hands](#the-agent-has-no-hands).
+The other twelve cannot be the engine here - pi, omp, openclaw, hermes and
+muse have no one-shot mode; codex, cursor-agent and grok keep file reads in
+their most restricted modes; crush has no restricted mode; copilot could not
+be shown to lose the network; gemini's deny-all policy could not be checked;
+opencode merges per-agent tool permissions from your own config over any
+catch-all - so with any of those as your default the planner and the manual
+use `claude` when it is installed, and say so. Handing work off with "ask the
 agent to ..." works with all thirteen either way, because that is a
 deliberate, interactive launch through `omarchy agent`, which Omarchy maps
 itself.
@@ -614,14 +615,11 @@ instructions either. The reply is the only thing it can produce.
 | agent | how | leaves it able to | checked |
 |---|---|---|---|
 | claude | `--tools ""`, `--strict-mcp-config`, `--setting-sources ""` | nothing | asked to run `id` and to read a file: "NO TOOLS" to both |
-| opencode | `"permission": {"*": "deny"}`, as the project config it runs in and inline via `OPENCODE_CONFIG_CONTENT`, above every other config | nothing | pointed at a local stand-in for a model endpoint: unrestricted it sent ten tool definitions plus an MCP server's tool; with the rule, an empty list in every request |
 
-Those flags were each read out of the CLI's own documentation. claude's were
-confirmed by asking it to use a tool and watching it say it could not;
-opencode's by reading the request it makes to the model, which is the surer
-test, since a catch-all permission rule has to cover tools from MCP servers
-and plugins configured anywhere in the user's own config, not only the
-built-in ones a project config can name.
+Those flags were read out of the CLI's own documentation and confirmed by
+asking claude to use a tool and watching it say it could not. `--setting-
+sources ""` matters as much as `--tools ""`: it is what stops a settings file
+of your own from putting a tool, a hook or an MCP server back.
 Under the previous invocation Claude answered the same probe by *calling
 Bash* - which is what the review of this project caught, and why the table
 exists. "Read-only" does not qualify: a sandbox that still reads files lets a
@@ -629,8 +627,11 @@ forged title pull a private file into the model's context, and the reply is
 spoken and cached. So codex (read-only sandbox keeps reads and a shell),
 cursor-agent and grok (plan mode keeps reads), crush (no restricted mode),
 copilot (with every tool it lists excluded and url access denied, it still
-fetched a web page when asked) and gemini (its policy engine documents a
-deny-all rule, but it could not be checked here) are not engines here. An
+fetched a web page when asked), gemini (its policy engine documents a
+deny-all rule, but it could not be checked here) and opencode (a catch-all
+deny holds at the wire, read off the requests it sent to a local stand-in
+endpoint, but per-agent permission rules from your own config merge over it)
+are not engines here. An
 agent joins the table when its tool-free form has been checked, and
 `tests/test_agent.py` keeps it that way.
 
