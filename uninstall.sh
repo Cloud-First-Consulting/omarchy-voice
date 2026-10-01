@@ -22,16 +22,40 @@ CONFIG_DIR="$HOME/.config/omarchy"
 purge=0
 [[ ${1:-} == --purge ]] && purge=1
 
-# The listener first, so nothing below pulls a script out from under it.
-if systemctl --user is-enabled omarchy-voice-wake >/dev/null 2>&1 \
-   || systemctl --user is-active omarchy-voice-wake >/dev/null 2>&1; then
-  systemctl --user disable --now omarchy-voice-wake 2>/dev/null
-  echo "  stopped omarchy-voice-wake"
-fi
-if [[ -f $UNIT ]]; then
-  rm -f "$UNIT"
-  systemctl --user daemon-reload
-  echo "  removed omarchy-voice-wake.service"
+# The listener first, so nothing below pulls a script out from under it - but
+# only if the unit at that path is the one install.sh wrote. install.sh marks
+# its copy with a first line naming itself and the sha256 of the body; the
+# same name with no marker (and not byte-identical to the repo's unit, which
+# earlier releases copied unmarked) is somebody else's service, and this
+# script neither stops nor removes it. A marked unit that has been edited is
+# stopped and disabled, since it runs the scripts unlinked below, but the file
+# itself is kept.
+UNIT_SRC="$REPO/systemd/omarchy-voice-wake.service"
+UNIT_MARK="# omarchy-voice: written by install.sh; body sha256 "
+unit_recorded_hash() { head -n 1 "$1" | sed -n "s/^${UNIT_MARK}\([0-9a-f]\{64\}\)\$/\1/p"; }
+unit_body_hash()     { tail -n +2 "$1" | sha256sum | cut -c1-64; }
+unit_owner() {
+  local recorded; recorded=$(unit_recorded_hash "$1")
+  if [[ -z $recorded ]]; then cmp -s "$1" "$UNIT_SRC" && return 0; return 2; fi
+  [[ $recorded == "$(unit_body_hash "$1")" ]] && return 0 || return 1
+}
+if [[ -f $UNIT && ! -L $UNIT ]]; then
+  unit_owner "$UNIT" && rc=0 || rc=$?
+  if (( rc == 2 )); then
+    echo "  kept $UNIT: not written by install.sh, so the service is left as it is"
+  else
+    systemctl --user disable --now omarchy-voice-wake 2>/dev/null
+    echo "  stopped omarchy-voice-wake"
+    if (( rc == 0 )); then
+      rm -f "$UNIT"
+      systemctl --user daemon-reload
+      echo "  removed omarchy-voice-wake.service"
+    else
+      echo "  kept $UNIT: edited since it was installed (disabled, not deleted)"
+    fi
+  fi
+elif [[ -L $UNIT ]]; then
+  echo "  kept $UNIT: a link, not a file install.sh wrote"
 fi
 
 # Only links that point into this repo. A same-named script that came from

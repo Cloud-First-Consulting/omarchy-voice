@@ -189,7 +189,8 @@ clone. Either way there is one copy.
 - symlinks `bin/*` into `~/.local/bin`
 - makes sure `~/.config/omarchy/plugins/omarchy-voice.marvin` is this clone,
   and prints the command to put the icon in your bar
-- installs and enables the user unit
+- installs and enables the user unit, with a first line that marks the copy
+  as its own; a unit of that name it did not write is never replaced
 - creates `~/.config/omarchy/voice-wake.json` from the example if you do not
   already have one
 
@@ -262,7 +263,9 @@ room where you would rather not leave a microphone open.
 `uninstall.sh` stops and disables the listener, removes the user unit, takes
 the icon out of the bar, and removes every link `install.sh` made, including
 any skill links - and only links that point into this clone, so a same-named
-script or skill from somewhere else is left alone. Your config and what it has learned stay unless you pass
+script or skill from somewhere else is left alone. The same goes for the unit:
+one that `install.sh` did not write is neither stopped nor removed, and one you
+have edited since is disabled but kept. Your config and what it has learned stay unless you pass
 `--purge`, which also removes `~/.config/omarchy/voice-wake.json`, the learned
 phrase cache and the cached Omarchy reference.
 

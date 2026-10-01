@@ -11,7 +11,9 @@
 #
 # Nothing here ever replaces something it did not make. A file or link that is
 # already at a target path and does not point into this clone is left alone
-# and reported, so a same-named tool from elsewhere survives an install.
+# and reported, so a same-named tool from elsewhere survives an install. The
+# systemd unit is the one copy rather than a link, so it carries a marker that
+# says who wrote it; see the unit section below.
 
 set -euo pipefail
 
@@ -66,10 +68,47 @@ for script in "$REPO"/bin/*; do
   link "$script" "$BIN/$name" && echo "  linked $name"
 done
 
-# Copied, not linked: systemd manages unit enablement with symlinks of its own,
-# and a unit file that is itself a symlink makes `enable` behave unpredictably.
-install -m 644 "$REPO/systemd/omarchy-voice-wake.service" "$UNIT/omarchy-voice-wake.service"
-echo "  installed omarchy-voice-wake.service"
+# The user unit. Copied, not linked: systemd manages unit enablement with
+# symlinks of its own, and a unit file that is itself a symlink makes `enable`
+# behave unpredictably.
+#
+# The copy carries a first line that names this script and the sha256 of the
+# body it wrote. That is how ownership is decided on the next run and on
+# uninstall: a unit with that line and a matching hash is ours and untouched,
+# so it may be replaced; one with the line but a different hash has been edited
+# by hand and is kept; one without the line is somebody else's service of the
+# same name, and this script will not write over it. A file byte-identical to
+# the repo's unit is also ours - earlier releases copied it without the marker.
+UNIT_SRC="$REPO/systemd/omarchy-voice-wake.service"
+UNIT_DST="$UNIT/omarchy-voice-wake.service"
+UNIT_MARK="# omarchy-voice: written by install.sh; body sha256 "
+
+unit_recorded_hash() { head -n 1 "$1" | sed -n "s/^${UNIT_MARK}\([0-9a-f]\{64\}\)\$/\1/p"; }
+unit_body_hash()     { tail -n +2 "$1" | sha256sum | cut -c1-64; }
+# ours, untouched (0); ours, edited (1); not ours (2)
+unit_owner() {
+  local recorded; recorded=$(unit_recorded_hash "$1")
+  if [[ -z $recorded ]]; then cmp -s "$1" "$UNIT_SRC" && return 0; return 2; fi
+  [[ $recorded == "$(unit_body_hash "$1")" ]] && return 0 || return 1
+}
+
+write_unit=1
+if [[ -L $UNIT_DST ]]; then
+  echo "  kept $UNIT_DST: a link, not a file this script wrote"
+  echo "    move it aside to install the listener's unit"; exit 1
+elif [[ -e $UNIT_DST ]]; then
+  unit_owner "$UNIT_DST" && rc=0 || rc=$?
+  case $rc in
+    1) echo "  kept $UNIT_DST: edited since it was installed (put changes in a drop-in to have them survive updates)"; write_unit=0 ;;
+    2) echo "  kept $UNIT_DST: not written by this script, so not replaced"
+       echo "    move it aside to install the listener's unit"; exit 1 ;;
+  esac
+fi
+if (( write_unit )); then
+  { printf '%s%s\n' "$UNIT_MARK" "$(sha256sum < "$UNIT_SRC" | cut -c1-64)"; cat "$UNIT_SRC"; } > "$UNIT_DST.tmp"
+  chmod 644 "$UNIT_DST.tmp" && mv -f "$UNIT_DST.tmp" "$UNIT_DST"
+  echo "  installed omarchy-voice-wake.service"
+fi
 
 # The agent skill, only when asked for and only for the tools named. It is
 # linked the way Omarchy links its own: one copy in the repo, one link per
