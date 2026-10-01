@@ -649,22 +649,36 @@ load` loads a shared object into the compositor; `omarchy plugin add` installs
 code from a URL and `omarchy launch terminal` takes a command to run; the
 voice browser wrapper used to pass its arguments to Chromium, flags included.
 So every program is allowed only in the shapes the catalogue actually offers,
-and an unknown subcommand is refused, not merely a dangerous one:
+matched whole - the right number of arguments, each of the right kind, and
+nothing after them - and an unknown subcommand is refused, not merely a
+dangerous one. A trailing argument is never ignored: Omarchy's launchers
+forward their whole argument list, so `omarchy launch browser <url>` followed
+by `--renderer-cmd-prefix=...` would have handed Chromium a native executable
+to run, and `omarchy launch editor +!id` would have had Neovim run a shell
+command. Flags are accepted only where a shape names them:
 
-- **omarchy** - a fixed set of groups (launch, theme, toggle, audio, bluetooth,
-  capture, reminder, display, hyprland, window, battery, system, version),
-  and within launch, theme, hyprland and system a fixed set of verbs.
-  `system` is `lock` and `stats`; shutdown, reboot and logout are refused.
-  `agent` is refused: starting a coding agent on a model-composed task is the
-  one thing the phrase table does only on a sentence you actually spoke.
+- **omarchy** - a table of exact shapes: `launch browser [url]`, `launch
+  editor <path>`, `theme set <name>`, `audio output volume <raise|lower|±N>`,
+  `bluetooth device <connect|disconnect> <mac>`, `reminder <minutes> [text]`,
+  and so on. `system` is `lock` and `stats`; shutdown, reboot and logout are
+  refused. Real subcommands that are deliberately absent: `launch terminal
+  <command>`, `launch or focus`, `capture screenshot --editor=<name>`, `theme
+  bg set <path>`, `theme install`, `bluetooth device pair|forget`, and every
+  group that installs or updates anything. `agent` is refused: starting a
+  coding agent on a model-composed task is the one thing the phrase table
+  does only on a sentence you actually spoke.
 - **hyprctl** - read-only queries, a named set of dispatchers, and exactly
   one `eval`: the screen-zoom expression, matched as a whole.
 - **systemctl** - `--user` only, start/stop/restart/status of one unit named
   without a path. No enable, link, edit or environment changes.
 - **nmcli** - reading state and switching a radio. No secrets (`-s`), no
   adding, changing or deleting connections.
-- **pactl / wpctl / bluetoothctl / voxtype** - a verb list each. No module
-  loading, no remote server, no pairing or removing devices, no config.
+- **pactl / wpctl / bluetoothctl / playerctl / brightnessctl / voxtype** - a
+  verb list each, values but no options after the verb. No module loading,
+  no remote server, no pairing or removing devices, no `playerctl open`.
+- **date / cal / du / df / ip / notify-send** - the few flags a spoken
+  question needs. No `date -f <file>`, `du --files0-from`, `ip -batch` or
+  anything else that reads a file into the output.
 - **curl** - a plain GET of an http(s) URL. `-sO` bundles into a single
   argument no exact-match rule sees, `-T` is `--upload-file`, `-K` reads any
   option at all from a file; allowing only what a GET needs ends the category.

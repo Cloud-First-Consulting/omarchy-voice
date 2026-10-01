@@ -37,34 +37,137 @@ ALLOWED = {
 # Never acceptable from a mishearing, whichever program.
 FORBIDDEN_WORDS = re.compile(r"^(poweroff|halt|shutdown|reboot|logout)$", re.I)
 
-# `omarchy <group> <verb>`: the verbs each group may be used with. A group that
-# is not here is refused, which covers pkg, plugin, update, install, webapp,
-# dev, default, config, menu and whatever is added next. `agent` is refused on
-# purpose: starting a coding agent on a model-composed task is the one thing
-# the phrase table does only on a sentence the user actually spoke.
-OMARCHY = {
-    "launch":    {"browser", "terminal", "nautilus", "editor", "spotify",
-                  "signal", "1password", "about", "screensaver", "discord"},
-    "theme":     {"set", "bg", "current", "list"},
-    "toggle":    None,            # every toggle is a desktop switch
-    "audio":     None,
-    "bluetooth": {"power", "device"},
-    "capture":   None,
-    "reminder":  None,
-    "display":   None,
-    "hyprland":  {"monitor", "focus", "workspace", "window"},
-    "window":    None,
-    "battery":   None,
-    "system":    {"lock", "stats"},
-    "version":   None,
-}
+# Every argument has a shape, and a command is matched whole: the right
+# number of arguments, each of the right kind, and nothing after them. A
+# trailing argument is never ignored, because a launcher that forwards its
+# argument list turns a trailing argument into a flag for the program it
+# starts - `omarchy launch browser <url> --renderer-cmd-prefix=...` would have
+# handed Chromium a native executable to run. Flags are accepted only where a
+# shape names them.
+def _url(a):   return a.startswith(("http://", "https://"))
+def _num(a):   return re.fullmatch(r"\d+(\.\d+)?", a) is not None
+def _mac(a):   return re.fullmatch(r"([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}", a) is not None
+def _word(a):  return re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", a) is not None
+def _name(a):  return bool(a) and not a.startswith(("-", "+")) and "/" not in a
+def _text(a):  return bool(a) and not a.startswith(("-", "+"))
+def _path(a):  return bool(a) and not a.startswith(("-", "+"))
+def _vol(a):   return a in {"raise", "lower", "mute-toggle"} or re.fullmatch(r"[+-]?\d+%?", a) is not None
+def _lit(*xs): return lambda a: a in xs
+OPT = object()  # marks the matcher before it as optional
+
+def _shape(args, spec):
+    """None if args fit spec - matchers in order, OPT after one that may be
+    absent - with nothing left over, else a reason."""
+    matchers = []
+    for item in spec:
+        if item is OPT:
+            matchers[-1] = (matchers[-1][0], True)
+        else:
+            matchers.append((item, False))
+    required = sum(1 for _, optional in matchers if not optional)
+    if len(args) < required:
+        return "too few arguments"
+    if len(args) > len(matchers):
+        return f"unexpected argument {args[len(matchers)]!r}"
+    for arg, (match, _) in zip(args, matchers):
+        if not match(arg):
+            return f"unexpected argument {arg!r}"
+    return None
+
+# `omarchy <words...>`: the exact shapes offered, longest prefix first. A
+# prefix that is not here is refused, which covers pkg, plugin, update,
+# install, webapp, dev, default, config, menu and whatever is added next.
+# `agent` is refused on purpose: starting a coding agent on a model-composed
+# task is the one thing the phrase table does only on a sentence the user
+# actually spoke. launch terminal <command>, launch or focus, launch editor
+# --inline, capture screenshot --editor=<name>, theme bg set <path>, theme
+# bg install, bluetooth device pair|forget and reminder -i are all real
+# subcommands that are deliberately not here.
+OMARCHY_SHAPES = [
+    (("launch", "browser"),            [_url, OPT]),
+    (("launch", "terminal"),           []),
+    (("launch", "nautilus"),           [_lit("cwd"), OPT]),
+    (("launch", "editor"),             [_path]),
+    (("launch", "spotify"),            []),
+    (("launch", "signal"),             []),
+    (("launch", "1password"),          []),
+    (("launch", "about"),              []),
+    (("launch", "screensaver"),        []),
+    (("launch", "discord"),            [_lit("community")]),
+    (("theme", "set"),                 [_name]),
+    (("theme", "bg"),                  [_lit("next", "current"), OPT]),
+    (("theme", "current"),             []),
+    (("theme", "list"),                []),
+    (("toggle",),                      [_word]),
+    (("audio", "output", "volume"),    [_vol]),
+    (("audio", "output", "switch"),    []),
+    (("audio", "output", "sink"),      [_name, OPT]),
+    (("audio", "output", "set", "default"), [_word, _name]),
+    (("audio", "input", "set", "default"),  [_word, _name]),
+    (("audio", "input", "mute"),       []),
+    (("bluetooth", "power"),           [_lit("on", "off", "toggle", "is-on")]),
+    (("bluetooth", "device"),          [_lit("connect", "disconnect"), _mac]),
+    (("capture", "screenshot"),        [_lit("smart", "region", "windows", "fullscreen"), OPT,
+                                        _lit("slurp", "copy", "save"), OPT]),
+    (("capture", "screenrecording"),   "RECORDING"),
+    (("capture", "text"),              []),
+    (("capture", "qr"),                []),
+    (("reminder", "show"),             []),
+    (("reminder", "clear"),            []),
+    (("reminder",),                    [_num, _text, OPT]),
+    (("display", "text", "size"),      [lambda a: _num(a) or a == "reset", OPT]),
+    (("hyprland", "monitor", "scaling"), [lambda a: a in {"up", "down"} or _num(a), OPT]),
+    (("hyprland", "focus", "app"),     [_name]),
+    (("hyprland", "workspace", "layout", "toggle"), []),
+    (("hyprland", "window", "close", "all"), []),
+    (("hyprland", "window", "gaps", "toggle"), []),
+    (("hyprland", "window", "transparency", "toggle"), []),
+    (("hyprland", "window", "tiled", "fullscreen", "toggle"), []),
+    (("hyprland", "window", "single", "square", "aspect", "toggle"), []),
+    (("hyprland", "window", "width"),  [_lit("save", "restore")]),
+    (("hyprland", "window", "pop"),    [_num, OPT, _num, OPT, _num, OPT, _num, OPT]),
+    (("window", "close", "all"),       []),
+    (("window", "gaps", "toggle"),     []),
+    (("window", "transparency", "toggle"), []),
+    (("window", "tiled", "fullscreen", "toggle"), []),
+    (("window", "single", "square", "aspect", "toggle"), []),
+    (("window", "width"),              [_lit("save", "restore")]),
+    (("window", "pop"),                [_num, OPT, _num, OPT, _num, OPT, _num, OPT]),
+    (("battery", "status"),            []),
+    (("battery", "present"),           []),
+    (("system", "lock"),               []),
+    (("system", "stats"),              []),
+    (("version",),                     []),
+]
+RECORDING_FLAGS = {"--fullscreen", "--stop-recording", "--with-desktop-audio",
+                   "--with-microphone-audio"}
+
+
+def _omarchy(argv):
+    words = argv[1:]
+    if not words:
+        return "omarchy needs a command"
+    for prefix, spec in sorted(OMARCHY_SHAPES, key=lambda x: -len(x[0])):
+        if tuple(words[:len(prefix)]) == prefix:
+            rest = words[len(prefix):]
+            if spec == "RECORDING":
+                bad = [a for a in rest if a not in RECORDING_FLAGS]
+                return f"unexpected argument {bad[0]!r}" if bad else None
+            reason = _shape(rest, spec)
+            return f"omarchy {' '.join(prefix)}: {reason}" if reason else None
+    return f"omarchy {' '.join(words[:2])} is not available to voice"
+
 
 HYPRCTL_QUERIES = {"monitors", "clients", "activewindow", "workspaces",
                    "binds", "devices", "version", "activeworkspace", "layers"}
-HYPRCTL_DISPATCH = {"workspace", "killactive", "fullscreen", "togglefloating",
-                    "focuswindow", "movetoworkspace", "movetoworkspacesilent",
-                    "movefocus", "cyclenext", "togglesplit", "pin",
-                    "centerwindow", "focusmonitor", "dpms"}
+HYPRCTL_DISPATCH = {
+    "workspace": [_word], "killactive": [], "fullscreen": [_lit("0", "1", "2"), OPT],
+    "togglefloating": [], "focuswindow": [_name], "movetoworkspace": [_name],
+    "movetoworkspacesilent": [_name], "movefocus": [_lit("l", "r", "u", "d")],
+    "cyclenext": [_lit("prev"), OPT], "togglesplit": [], "pin": [],
+    "centerwindow": [], "focusmonitor": [_name],
+    "dpms": [_lit("on", "off", "toggle"), _name, OPT],
+}
 # The one eval the catalogue offers: screen zoom. Exactly that shape.
 HYPRCTL_ZOOM = re.compile(
     r"^hl\.config\(\s*\{\s*cursor\s*=\s*\{\s*zoom_factor\s*=\s*\d+(\.\d+)?\s*\}\s*\}\s*\)$")
@@ -84,6 +187,8 @@ WPCTL_VERBS = {"set-volume", "set-mute", "set-default", "status", "get-volume",
 BLUETOOTHCTL_VERBS = {"power", "connect", "disconnect", "show", "devices",
                       "info", "scan", "discoverable"}
 VOXTYPE_VERBS = {"status", "record"}
+PLAYERCTL_VERBS = {"play", "pause", "play-pause", "stop", "next", "previous",
+                   "status", "metadata", "volume", "position", "shuffle", "loop"}
 IP_MUTATING = {"add", "del", "delete", "change", "replace", "flush", "set",
                "append", "prepend", "monitor"}
 
@@ -127,35 +232,6 @@ def _curl(argv):
     return None if target else "curl needs a URL"
 
 
-def _omarchy(argv):
-    if len(argv) < 2:
-        return "omarchy needs a command"
-    group, rest = argv[1], argv[2:]
-    if group not in OMARCHY:
-        return f"omarchy {group} is not available to voice"
-    verbs = OMARCHY[group]
-    if verbs is not None:
-        if not rest:
-            return f"omarchy {group} needs a verb"
-        if rest[0] not in verbs:
-            return f"omarchy {group} {rest[0]} is not available to voice"
-    if group == "launch":
-        # `launch terminal <command>`, `launch or focus <pattern> <command>` and
-        # `launch floating terminal ... <command>` all run a command; none of
-        # those shapes is offered. browser takes a URL, editor a path.
-        if rest[0] == "terminal" and len(rest) > 1:
-            return "the terminal may be opened, not given a command"
-        if rest[0] == "browser" and len(rest) > 1 and not _http(rest[1]):
-            return "the browser may only be given an http(s) URL"
-        if rest[0] == "discord" and rest[1:] != ["community"]:
-            return "omarchy launch discord takes only 'community'"
-    if group == "hyprland" and rest[0] == "monitor" and rest[1:2] != ["scaling"]:
-        return "only monitor scaling is available to voice"
-    if group == "theme" and rest[0] == "bg" and rest[1:] not in ([], ["next"]):
-        return "theme bg may only be asked for the next wallpaper"
-    return None
-
-
 def _hyprctl(argv):
     rest = argv[1:]
     if rest and rest[0] in {"-j", "--json"}:
@@ -167,7 +243,8 @@ def _hyprctl(argv):
     if rest[0] == "dispatch":
         if len(rest) < 2 or rest[1] not in HYPRCTL_DISPATCH:
             return f"hyprctl dispatch {rest[1] if len(rest) > 1 else ''} is not available to voice".replace("  ", " ")
-        return None
+        reason = _shape(rest[2:], HYPRCTL_DISPATCH[rest[1]])
+        return f"hyprctl dispatch {rest[1]}: {reason}" if reason else None
     if rest[0] == "eval":
         if len(rest) == 2 and HYPRCTL_ZOOM.match(rest[1]):
             return None
@@ -238,38 +315,82 @@ def vet(argv):
             return "xdg-open may only open one http(s) URL"
         return None
     if prog == "omarchy-voice-browser":
-        for arg in argv[1:]:
-            if not _http(arg):
-                return "the voice browser may only be given http(s) URLs"
-        return None
+        return _shape(argv[1:], [_url, OPT]) and "the voice browser may only be given one http(s) URL"
     if prog == "omarchy-window":
         if len(argv) < 2 or argv[1] not in {"close", "focus", "list"}:
             return "omarchy-window may only close, focus or list"
-        if any(a.startswith("-") for a in argv[2:]):
-            return "omarchy-window takes a window name, not options"
+        if _shape(argv[2:], [] if argv[1] == "list" else [_text]):
+            return "omarchy-window takes one window name, not options"
         return None
-    if prog == "pactl":
-        if len(argv) < 2 or argv[1] not in PACTL_VERBS:
-            return "that pactl command is not available to voice"
+    if prog in {"pactl", "wpctl", "bluetoothctl"}:
+        verbs = {"pactl": PACTL_VERBS, "wpctl": WPCTL_VERBS, "bluetoothctl": BLUETOOTHCTL_VERBS}[prog]
+        if len(argv) < 2 or argv[1] not in verbs:
+            return f"that {prog} command is not available to voice"
+        if len(argv) > 5 or any(a.startswith("-") for a in argv[2:]):
+            return f"{prog} {argv[1]} takes names and values, not options"
         return None
-    if prog == "wpctl":
-        if len(argv) < 2 or argv[1] not in WPCTL_VERBS:
-            return "that wpctl command is not available to voice"
-        return None
-    if prog == "bluetoothctl":
-        if len(argv) < 2 or argv[1] not in BLUETOOTHCTL_VERBS:
-            return "that bluetoothctl command is not available to voice"
-        return None
+    if prog == "playerctl":
+        rest = argv[1:]
+        while rest and rest[0] in {"-a", "--all-players"} or (rest and rest[0] in {"-p", "--player"} and len(rest) > 1 and _name(rest[1])):
+            rest = rest[2:] if rest[0] in {"-p", "--player"} else rest[1:]
+        if not rest or rest[0] not in PLAYERCTL_VERBS:
+            return "that playerctl command is not available to voice"
+        value = lambda a: re.fullmatch(r"[+-]?\d+(\.\d+)?[+-]?|[A-Za-z]+", a) is not None
+        return _shape(rest[1:], [value, OPT]) and "playerctl takes one value after the command"
+    if prog == "brightnessctl":
+        rest = argv[1:]
+        while rest and rest[0] in {"-d", "--device", "-c", "--class"} and len(rest) > 1 and _name(rest[1]):
+            rest = rest[2:]
+        if not rest or rest[0] not in {"set", "get", "max", "info", "list"}:
+            return "that brightnessctl command is not available to voice"
+        spec = [lambda a: re.fullmatch(r"\d+%?[+-]?|[+-]\d+%?", a) is not None] if rest[0] == "set" else []
+        return _shape(rest[1:], spec) and "brightnessctl set takes one level"
     if prog == "voxtype":
         if len(argv) < 2 or argv[1] not in VOXTYPE_VERBS:
             return "voxtype may only be asked to record or for its status"
-        if any(a.startswith("-") for a in argv[1:]):
-            return "voxtype options are not available to voice"
-        return None
+        return _shape(argv[2:], [_lit("start", "stop", "toggle", "cancel"), OPT]) and "voxtype takes one word after the command"
+    if prog == "notify-send":
+        rest, texts = argv[1:], 0
+        while rest:
+            if rest[0] in {"-t", "-u", "-a", "-i", "--expire-time", "--urgency", "--app-name", "--icon"} and len(rest) > 1 and _text(rest[1]):
+                rest = rest[2:]
+            elif rest[0] in {"-e", "--transient"}:
+                rest = rest[1:]
+            elif _text(rest[0]) and texts < 2:
+                rest, texts = rest[1:], texts + 1
+            else:
+                return f"notify-send: unexpected argument {rest[0]!r}"
+        return None if texts else "notify-send needs a message"
     if prog == "ip":
-        if any(a in IP_MUTATING for a in argv[1:]):
+        rest = argv[1:]
+        while rest and rest[0] in {"-br", "-brief", "-4", "-6", "-j", "-json", "-c", "-color"}:
+            rest = rest[1:]
+        if not rest or rest[0] not in {"addr", "address", "a", "link", "l", "route", "r", "neigh", "neighbour", "n", "rule"}:
+            return "ip may only show addresses, links, routes, neighbours or rules"
+        if len(rest) > 5 or any(a.startswith("-") or a in IP_MUTATING for a in rest[1:]):
             return "ip may only show network state"
         return None
-    if prog == "date" and any(a in {"-s", "--set"} or a.startswith("--set=") for a in argv[1:]):
-        return "the clock may not be set by voice"
+    if prog == "date":
+        bad = [a for a in argv[1:] if not (a.startswith("+") or a in {"-u", "--utc", "-R", "--rfc-email", "-I", "--iso-8601"})]
+        return f"date: unexpected argument {bad[0]!r}" if bad else None
+    if prog == "cal":
+        bad = [a for a in argv[1:] if not (a in {"-m", "-y", "-3", "-1"} or _num(a))]
+        return f"cal: unexpected argument {bad[0]!r}" if bad or len(argv) > 4 else None
+    if prog == "uptime":
+        bad = [a for a in argv[1:] if a not in {"-p", "--pretty", "-s", "--since"}]
+        return f"uptime: unexpected argument {bad[0]!r}" if bad else None
+    if prog == "free":
+        bad = [a for a in argv[1:] if a not in {"-h", "--human", "-m", "-g", "--mega", "--giga"}]
+        return f"free: unexpected argument {bad[0]!r}" if bad else None
+    if prog in {"df", "du"}:
+        letters = set("hHTi") if prog == "df" else set("hsca")
+        longs = {"--human-readable"} | ({"--summarize"} if prog == "du" else set())
+        rest = argv[1:]
+        while rest and (rest[0] in longs or (re.fullmatch(r"-[A-Za-z]+", rest[0]) and set(rest[0][1:]) <= letters)):
+            rest = rest[1:]
+        if prog == "du" and rest[:1] == ["-d"] and len(rest) > 1 and _num(rest[1]):
+            rest = rest[2:]
+        if len(rest) > 3 or any(not _path(a) for a in rest):
+            return f"{prog} takes a few paths, not options"
+        return None
     return None
