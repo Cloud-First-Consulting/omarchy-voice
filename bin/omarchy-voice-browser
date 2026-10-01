@@ -13,6 +13,18 @@
 PROFILE="$HOME/.local/share/omarchy-voice-browser"
 PORT="${OMARCHY_CDP_PORT:-9222}"
 
+# Only URLs reach Chromium. This is on the planner's allowlist, so its
+# arguments can come from a model; a flag here would otherwise be a flag to
+# Chromium - --user-data-dir pointed at the everyday profile, say, which would
+# put that profile's sessions behind the debugging port. The planner's vet
+# refuses the same, and this is the copy that holds if it is bypassed.
+for arg in "$@"; do
+  case $arg in
+    http://*|https://*) ;;
+    *) echo "omarchy-voice-browser: only http(s) URLs are accepted, not '$arg'" >&2; exit 2 ;;
+  esac
+done
+
 exec /usr/bin/chromium \
   --user-data-dir="$PROFILE" \
   --remote-debugging-port="$PORT" \

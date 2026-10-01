@@ -116,13 +116,17 @@ Whichever one Omarchy is set to use is the one that answers:
 
     omarchy default agent codex        # or claude, opencode, copilot, ...
 
-Eight of the agents Omarchy supports can answer a single question without a
-terminal, and are used directly: **claude, codex, gemini, opencode, crush,
-cursor-agent, copilot** and **grok**. The other five - pi, omp, openclaw,
-hermes and muse - have no one-shot mode to call, so if one of those is your
-default the manual falls back to `claude` when it is installed and says so.
-Handing work off with "ask the agent to ..." works with all thirteen either
-way, because that goes through `omarchy agent`, which Omarchy maps itself.
+Seven of the agents Omarchy supports can answer a single question without a
+terminal *and without their tools*, and are used directly: **claude, codex,
+gemini, opencode, cursor-agent, copilot** and **grok**. The agent is only ever
+asked for words; see [The agent has no hands](#the-agent-has-no-hands). The
+other six - pi, omp, openclaw, hermes and muse have no one-shot mode, and
+crush has no documented way to withhold its tools from one - cannot be the
+engine here, so if one of those is your default the manual falls back to
+`claude` when it is installed and says so. Handing work off with "ask the
+agent to ..." works with all thirteen either way, because that is a
+deliberate, interactive launch through `omarchy agent`, which Omarchy maps
+itself.
 
 `OMARCHY_VOICE_AGENT=opencode` overrides the choice for one run, which is the
 quickest way to try another one.
@@ -484,7 +488,10 @@ places - one is a room full of people, the other is a meeting.
     bin/omarchy-voice-wake-check   post-boot health check
     bin/omarchy-voice-wake-toggle  start/stop, for a keybinding
     lib/omarchy_voice_ui.py        the animated progress notification, shared
-    lib/omarchy_voice_agent.py     which coding agent answers, and how to ask it
+    lib/omarchy_voice_agent.py     which coding agent answers, and how to ask it with no tools
+    lib/omarchy_voice_vet.py       the one boundary a model-composed command must pass
+    tests/                         the boundary and the agent flags, as cases
+    config/gemini-no-tools.toml    the deny-all policy gemini is run with
     AGENTS.md                      notes for a coding agent working on this repo
     skills/omarchy-hotkeys/        so any agent answers key questions from this machine (opt-in)
     systemd/                       the user unit
@@ -586,33 +593,80 @@ trained you to ignore them.
 
 ## Safety
 
-The model returns argv arrays, never shell strings, and nothing reaches a shell
-- so there is no quoting or injection surface. Every `argv[0]` is checked
-against a small allowlist on every run, including replays from the learned
-cache: what is cached is the answer to "what did you mean", never permission to
-run it. Shutdown, reboot and logout are refused.
+Three scripts run commands a language model composed: the planner, `--run` on
+the Omarchy manual, and `--fix` on the diagnoser. All three go through one
+boundary, `lib/omarchy_voice_vet.py`, and the model that composed the command
+had no tools of its own while it did. Those are the two halves; each is
+described below, and `tests/test_vet.py` and `tests/test_agent.py` hold them
+in place (`python3 -m unittest discover -s tests`).
+
+### The agent has no hands
+
+The prompt an agent is given contains text from somewhere untrusted - the
+titles of open windows, the elements on a web page, lines out of the journal.
+A model can be talked into things by text it is shown, and a coding agent
+with its tools available would be talked into *doing* them - reading a file,
+running a command, fetching a URL - inside the agent, before anything here
+sees the reply. So every agent is invoked in the form that withholds its
+tools, and runs from an empty runtime directory so it picks up no project
+instructions either. The reply is the only thing it can produce.
+
+| agent | how | leaves it able to | checked |
+|---|---|---|---|
+| claude | `--tools ""`, `--strict-mcp-config`, `--setting-sources ""` | nothing | asked to run `id` and to read a file: "NO TOOLS" to both |
+| copilot | `--deny-tool shell`, `write`, `url`; `--disable-builtin-mcps` | nothing that touches the machine | same two probes, same answer |
+| opencode | a project config in its working directory with every tool `false` | nothing | config key is documented; the free tier here refuses tool-less requests, so not probed |
+| gemini | `--policy config/gemini-no-tools.toml`, a deny-all rule | nothing | flags parse; no account here to probe |
+| codex | `--sandbox read-only` | read files, no writes, no network | flags parse; no account here |
+| cursor-agent | `--mode plan --sandbox enabled` | read-only | flags parse; no account here |
+| grok | `--tools ""`, `--permission-mode plan`, no web, no subagents | nothing | flags parse; no account here |
+
+Those flags were each read out of the CLI's own `--help`; the ones marked as
+probed were confirmed by asking the agent to use a tool and watching it say it
+could not. Under the previous invocation Claude answered the same probe by
+*calling Bash* - which is what the review of this project caught, and why the
+table exists. `crush run` has no documented way to be asked without its tools,
+so it is not an engine here; the user's choice of crush for everything else
+is unaffected.
+
+### One boundary, by shape
+
+The model returns argv arrays, never shell strings, and nothing reaches a
+shell - so there is no quoting or injection surface. Every array is checked by
+`vet()` on every run, including replays from the learned cache: what is cached
+is the answer to "what did you mean", never permission to run it.
 
 An allowlist of program names is not on its own a boundary, because several of
-those programs will do anything you ask of them given the right flag. Three are
-therefore vetted by the shape they are used in rather than by a list of the
-flags that are dangerous:
+those programs will do anything you ask of them given the right first
+argument. `hyprctl dispatch exec` runs a shell command and `hyprctl plugin
+load` loads a shared object into the compositor; `omarchy plugin add` installs
+code from a URL and `omarchy launch terminal` takes a command to run; the
+voice browser wrapper used to pass its arguments to Chromium, flags included.
+So every program is allowed only in the shapes the catalogue actually offers,
+and an unknown subcommand is refused, not merely a dangerous one:
 
-- **curl** is here for one thing, the one-line weather, so it is allowed only
-  as a plain GET: safe flags, http(s) targets, no local paths. A denylist was
-  tried first and kept losing - `-sO` bundles into a single argument that no
-  exact-match rule sees, `-T` is `--upload-file`'s short form, and `-K` reads
-  any option at all out of a file. Each of those writes to disk or sends a file
-  off the machine.
-- **nmcli** may not be asked for secrets. `nmcli -s` prints saved wifi
-  passwords in the clear, and an answer this produces can be spoken aloud and
-  written to the learned cache.
-- **xdg-open** may only open http(s) URLs. It hands whatever it is given to the
-  desktop's registered handler, so a local path opens a file and another scheme
-  picks that scheme's handler.
+- **omarchy** - a fixed set of groups (launch, theme, toggle, audio, bluetooth,
+  capture, reminder, display, hyprland, window, battery, system, version),
+  and within launch, theme, hyprland and system a fixed set of verbs.
+  `system` is `lock` and `stats`; shutdown, reboot and logout are refused.
+  `agent` is refused: starting a coding agent on a model-composed task is the
+  one thing the phrase table does only on a sentence you actually spoke.
+- **hyprctl** - read-only queries, a named set of dispatchers, and exactly
+  one `eval`: the screen-zoom expression, matched as a whole.
+- **systemctl** - `--user` only, start/stop/restart/status of one unit named
+  without a path. No enable, link, edit or environment changes.
+- **nmcli** - reading state and switching a radio. No secrets (`-s`), no
+  adding, changing or deleting connections.
+- **pactl / wpctl / bluetoothctl / voxtype** - a verb list each. No module
+  loading, no remote server, no pairing or removing devices, no config.
+- **curl** - a plain GET of an http(s) URL. `-sO` bundles into a single
+  argument no exact-match rule sees, `-T` is `--upload-file`, `-K` reads any
+  option at all from a file; allowing only what a GET needs ends the category.
+- **xdg-open** and **omarchy-voice-browser** - http(s) URLs only. The wrapper
+  checks again itself, so the rule holds even if it is reached another way.
 
-`systemctl` is confined to `--user`. The set of refusals is exercised directly
-against `vet()`, so a regression shows up as a failing case rather than as a
-surprise.
+The table is small on purpose and grows only when a real request needed it,
+with a test case first.
 
 ### A window title is not an instruction
 

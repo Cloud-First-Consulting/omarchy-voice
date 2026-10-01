@@ -1,107 +1,172 @@
-"""Ask the machine's chosen coding agent exactly one question.
+"""Ask the machine's chosen coding agent exactly one question, with no tools.
 
 Both the planner and the Omarchy manual want the same narrow thing: one prompt
-in, one reply out, no session, no terminal. Every agent spells that
-differently, and several spell it in a way that is easy to get wrong - the
-flag that launches an agent to work interactively is rarely the flag that
-answers a single question and exits.
+in, one reply out, no session, no terminal - and no hands. The prompt the
+agent is given contains text that came from somewhere untrusted: the titles
+of open windows (a web page sets its own), the elements on a page, lines out
+of the journal. A model can be talked into things by text it is shown, and a
+coding agent with its tools available would then be talked into *doing* them
+- reading a file, running a command, fetching a URL - inside the agent, before
+anything here gets to vet the reply. So every agent below is invoked in a
+form that withholds its tools, and the reply is the only thing it can produce.
 
-Omarchy already knows which agent the user picked, so that is where the choice
-comes from rather than from a setting of our own. What Omarchy's own launcher
-cannot give us is the invocation: `omarchy agent` deliberately starts each
-agent in its interactive mode, attached to a terminal, which would hang here.
+Each agent spells that differently, and the flag that launches an agent to
+work interactively is rarely the flag that answers one question and exits.
+Both live in the table below:
 
-Two things vary per agent and both live in the table below:
-
-  argv      how to ask one question and have the process exit
+  argv      how to ask one question, tool-free, and have the process exit
   envelope  whether the reply arrives as text, or wrapped in JSON
+  access    what the flags leave the agent able to do, in one phrase
+  verified  whether that was confirmed by asking it to use a tool and
+            watching it fail, on a logged-in install of that CLI
+
+An agent whose CLI offers no documented way to withhold its tools is not in
+the table. It still works for "ask the agent to ..." - that is a deliberate
+handoff through `omarchy agent prompt`, started only on a sentence the user
+spoke - but it cannot be the engine behind the planner or the manual, and
+`claude` answers instead when it is installed, with a note saying so.
+
+Every agent also runs from an empty runtime directory rather than $HOME, so
+none of them picks up a CLAUDE.md, AGENTS.md or project config that happens
+to be lying around. For opencode that directory is also where its tool-free
+project configuration is written.
 
 Only the envelope is unwrapped here. Finding the JSON object the caller asked
 the model for is the caller's job, because it already has to do that anyway:
 agents add banners, and models add prose around JSON no matter how firmly they
 are told not to.
-
-Each invocation below was run against the real CLI. Three returned the
-answer outright; the rest parsed their flags and stopped at the machine's own
-missing credentials, which is evidence the invocation is right and the account
-is not set up, not evidence the invocation is wrong:
-
-    claude      answered
-    opencode    answered
-    copilot     answered
-    codex       reached the API, 401 - no OpenAI credentials here
-    gemini      exit 41, no auth method configured
-    crush       no providers configured
-    cursor-agent  authentication required
-    grok        not signed in
-
-So a failure here is almost always "that agent is not logged in", and the
-error says which agent, rather than silently handing the question to a
-different one and returning an answer the user did not ask for.
 """
 
 import json
 import os
+import pathlib
 import shutil
 import subprocess
 
-# Agent -> how to ask it one question.
-#
-#   argv(prompt, model) -> the command to run
-#   envelope            -> "json" if the reply is wrapped, "text" if it is bare
-#
-# `model` is passed only where an agent takes a model on the command line in a
-# form we know. Everywhere else the agent's own configured default is used,
-# which is the right behaviour anyway: the user chose that agent and its model.
+HERE = pathlib.Path(__file__).resolve().parent
+GEMINI_POLICY = HERE.parent / "config" / "gemini-no-tools.toml"
+
+# Every tool opencode knows, switched off. Written as the project config of
+# the directory the agent runs in, which opencode merges over the user's own
+# config - so their provider and model stay, and only the tools go.
+OPENCODE_NO_TOOLS = {
+    "$schema": "https://opencode.ai/config.json",
+    "tools": {name: False for name in (
+        "bash", "read", "write", "edit", "patch", "glob", "grep", "list",
+        "webfetch", "websearch", "todowrite", "todoread", "task", "skill")},
+}
+
 ADAPTERS = {
-    # VERIFIED. --max-turns 1 keeps it to a single answer with no tool use.
+    # --tools "" removes every built-in tool; --strict-mcp-config with no
+    # --mcp-config removes every MCP server; --setting-sources "" ignores the
+    # settings files that could add either back. Asked to run `id` with Bash
+    # and to read a file with Read, it answered "NO TOOLS" to both.
     "claude": {
         "argv": lambda p, m: ["claude", "-p", p, "--output-format", "json",
-                              "--max-turns", "1"] + (["--model", m] if m else []),
+                              "--max-turns", "1", "--tools", "",
+                              "--strict-mcp-config", "--setting-sources", "",
+                              "--no-session-persistence",
+                              "--disable-slash-commands"]
+                             + (["--model", m] if m else []),
         "envelope": "json",
+        "access": "no tools",
+        "verified": True,
     },
-    # --skip-git-repo-check is not optional here. `codex exec` refuses to run
-    # outside a directory it trusts, and the wake listener runs from $HOME, so
-    # without it every single question fails with "Not inside a trusted
-    # directory" - which reads like a bug in this and is not.
-    "codex": {
-        "argv": lambda p, m: ["codex", "exec", "--skip-git-repo-check", p],
-        "envelope": "text",
-    },
-    "gemini": {
-        "argv": lambda p, m: ["gemini", "-p", p],
-        "envelope": "text",
-    },
-    "opencode": {
-        "argv": lambda p, m: ["opencode", "run", p],
-        "envelope": "text",
-    },
-    # Omarchy's own launcher notes that `crush run` never prompts, which is
-    # exactly the property this path needs.
-    "crush": {
-        "argv": lambda p, m: ["crush", "run", p],
-        "envelope": "text",
-    },
-    "cursor-agent": {
-        "argv": lambda p, m: ["cursor-agent", "-p", p],
-        "envelope": "text",
-    },
+    # Denial rules take precedence over everything in copilot, including
+    # --allow-all-tools; shell(), write() and url() without an argument match
+    # every shell command, every file write and every URL. Built-in MCP
+    # servers are off. The same two probes answered "NO TOOLS".
     "copilot": {
-        "argv": lambda p, m: ["copilot", "-p", p, "--allow-all"],
+        "argv": lambda p, m: ["copilot", "-p", p, "-s",
+                              "--deny-tool", "shell", "--deny-tool", "write",
+                              "--deny-tool", "url", "--disable-builtin-mcps"],
         "envelope": "text",
+        "access": "no shell, no writes, no network, no MCP",
+        "verified": True,
     },
-    "grok": {
-        "argv": lambda p, m: ["grok", "-p", p],
+    # opencode merges the project config in its working directory over the
+    # user's; OPENCODE_NO_TOOLS is written there before every call. The
+    # `tools` map is documented in opencode's config schema. Not probed: the
+    # only opencode account here is its free tier, and that provider refuses
+    # a request once the tools are gone ("can only be used from within
+    # OpenCode"), so the probe never reached a model.
+    "opencode": {
+        "argv": lambda p, m: ["opencode", "run", "--dir", str(workdir()), p],
         "envelope": "text",
+        "access": "no tools (project config)",
+        "verified": False,
+    },
+    # A user-tier policy rule that denies every tool. --approval-mode plan
+    # alone is not enough: gemini overrides it in a folder it does not trust,
+    # which the runtime directory is not. Flags verified to parse; the deny
+    # itself could not be exercised here (no Gemini account).
+    "gemini": {
+        "argv": lambda p, m: ["gemini", "-p", p, "--policy", str(GEMINI_POLICY),
+                              "--approval-mode", "plan"],
+        "envelope": "text",
+        "access": "no tools (policy)",
+        "verified": False,
+    },
+    # Read-only sandbox: the shell tool exists but may not write or reach the
+    # network. --skip-git-repo-check because exec refuses to run outside a
+    # directory it trusts. Flags verified to parse; no OpenAI account here.
+    "codex": {
+        "argv": lambda p, m: ["codex", "exec", "--skip-git-repo-check",
+                              "--sandbox", "read-only", p],
+        "envelope": "text",
+        "access": "read-only sandbox",
+        "verified": False,
+    },
+    # plan mode is documented as read-only; the sandbox is turned on as well.
+    # Flags verified to parse; no Cursor account here.
+    "cursor-agent": {
+        "argv": lambda p, m: ["cursor-agent", "-p", "--mode", "plan",
+                              "--sandbox", "enabled", p],
+        "envelope": "text",
+        "access": "read-only (plan mode)",
+        "verified": False,
+    },
+    # --tools takes the built-in tools to allow, and is given none; plan mode
+    # is read-only on top; no web search, no subagents, one turn. Flags
+    # verified to parse; no xAI account here.
+    "grok": {
+        "argv": lambda p, m: ["grok", "-p", p, "--tools", "",
+                              "--permission-mode", "plan",
+                              "--disable-web-search", "--no-subagents",
+                              "--max-turns", "1"],
+        "envelope": "text",
+        "access": "no tools (plan mode)",
+        "verified": False,
     },
 }
 
-# Agents Omarchy can launch but which have no one-shot mode we are confident
-# enough to guess at. They still work for "ask the agent to ..." - that hands
-# off through `omarchy agent prompt`, which Omarchy maps correctly for every
-# agent it supports. They just cannot be the engine behind the phrase table's
-# fallback or the Omarchy manual.
-UNSUPPORTED = {"pi", "omp", "openclaw", "hermes", "muse"}
+# Agents Omarchy can launch but which cannot answer here. pi, omp, openclaw,
+# hermes and muse have no one-shot mode. crush has one, but no documented way
+# to withhold its tools from it, and Omarchy's own launcher notes that
+# `crush run` never prompts - which is the opposite of what this path needs.
+UNSUPPORTED = {"pi", "omp", "openclaw", "hermes", "muse", "crush"}
+
+# Flags that would hand an agent its tools back. Nothing in ADAPTERS may
+# contain one; tests/test_agent.py checks.
+PERMISSIVE = {
+    "--allow-all", "--allow-all-tools", "--allow-all-paths", "--allow-all-urls",
+    "--yolo", "--full-auto", "--force", "--always-approve", "--auto",
+    "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions",
+    "--dangerously-bypass-approvals-and-sandbox", "--approve-for-me",
+    "--approve-mcps", "--autopilot", "bypassPermissions", "danger-full-access",
+}
+
+
+def workdir():
+    """An empty directory of our own for the agent to run in."""
+    base = pathlib.Path(os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/omarchy-voice-{os.getuid()}")
+    path = base / "omarchy-voice" / "agent"
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+    return path
 
 
 def configured():
@@ -133,13 +198,13 @@ def resolve():
         if not chosen:
             return "claude", ""
         if chosen in UNSUPPORTED:
-            return "claude", f"{chosen} has no one-shot mode; answered with claude"
+            return "claude", f"{chosen} cannot be asked without its tools; answered with claude"
         if chosen not in ADAPTERS:
             return "claude", f"{chosen} is not known here; answered with claude"
         return "claude", f"{chosen} is not installed; answered with claude"
 
     if chosen in UNSUPPORTED:
-        return None, f"{chosen} cannot answer a single question, and claude is not installed"
+        return None, f"{chosen} cannot be asked a single question without its tools, and claude is not installed"
     if chosen and chosen not in ADAPTERS:
         return None, f"{chosen} is not one of the agents this can ask"
     if not chosen:
@@ -153,13 +218,21 @@ def ask(prompt, model=None, timeout=60):
     if agent is None:
         return None, note
 
+    cwd = workdir()
+    if agent == "opencode":
+        try:
+            (cwd / "opencode.json").write_text(json.dumps(OPENCODE_NO_TOOLS))
+        except OSError:
+            return None, "could not write opencode's tool-free configuration"
+
     argv = ADAPTERS[agent]["argv"](prompt, model if agent == "claude" else None)
+    assert not any(a in PERMISSIVE for a in argv), "a permissive flag reached an agent"
     try:
         # stdin closed, never inherited. Several of these read stdin when it is
         # open and append it to the prompt, so an inherited terminal would have
         # them sitting there waiting for input that is never coming while the
         # user waits for an answer.
-        proc = subprocess.run(argv, capture_output=True, text=True,
+        proc = subprocess.run(argv, capture_output=True, text=True, cwd=cwd,
                               timeout=timeout, stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
         return None, f"{agent} took too long"

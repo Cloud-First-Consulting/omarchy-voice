@@ -34,6 +34,7 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib"))
 from omarchy_voice_ui import Progress  # noqa: E402
 import omarchy_voice_agent as agent  # noqa: E402
+import omarchy_voice_vet as vetting  # noqa: E402
 
 MODEL = os.environ.get("OMARCHY_VOICE_MODEL", "haiku")
 TIMEOUT = int(os.environ.get("OMARCHY_VOICE_TIMEOUT", "90"))
@@ -127,9 +128,6 @@ words rather than symbols, and no markdown in "say".
 The question: {question}\
 """
 
-ALLOWED_PREFIX = ("omarchy", "hyprctl", "systemctl", "pactl", "wpctl", "bluetoothctl")
-FORBIDDEN = re.compile(
-    r"\b(shutdown|reboot|poweroff|halt|logout|mkfs|fdisk|luks|dd|rm)\b", re.I)
 
 
 def notify(title, body, icon="󰋗", timeout=9000):
@@ -180,16 +178,9 @@ def machine_context():
     return "\n".join(facts) or "  (nothing gathered)"
 
 
-def vet(argv):
-    """A command may be offered only if it is recognisably an Omarchy-shaped one."""
-    if not argv or not all(isinstance(a, str) for a in argv):
-        return "malformed"
-    if argv[0] not in ALLOWED_PREFIX:
-        return f"{argv[0]} is not a command this will run"
-    joined = " ".join(argv)
-    if FORBIDDEN.search(joined):
-        return "does something that should be done by hand"
-    return None
+# A command is offered, and with --run executed, only if it passes the same
+# boundary the planner uses: lib/omarchy_voice_vet.py, tests in tests/test_vet.py.
+vet = vetting.vet
 
 
 def ask(question):

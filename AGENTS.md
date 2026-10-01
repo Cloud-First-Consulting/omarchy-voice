@@ -64,7 +64,9 @@ one covers *changing* a binding and never tells an agent to read the live ones.
     bin/omarchy-voice-help         answers questions about Omarchy itself
     bin/omarchy-voice-diagnose     probes the machine, then explains what broke
     bin/omarchy-voice-reference    builds the reference the two above answer from
-    lib/omarchy_voice_agent.py     which coding agent answers, and how to ask it
+    lib/omarchy_voice_agent.py     which coding agent answers, and how to ask it with no tools
+    lib/omarchy_voice_vet.py       the one boundary a model-composed command must pass
+    tests/                         python3 -m unittest discover -s tests
 
 ## Conventions that are load-bearing
 
