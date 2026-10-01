@@ -17,7 +17,6 @@ import omarchy_voice_agent as agent  # noqa: E402
 REQUIRED = {
     "claude": [("--tools", ""), ("--strict-mcp-config",), ("--setting-sources", ""),
                ("--max-turns", "1")],
-    "gemini": [("--policy", str(agent.GEMINI_POLICY))],
     "opencode": [("--dir",)],
 }
 
@@ -58,17 +57,12 @@ class ToolFree(unittest.TestCase):
                 self.assertTrue(spec["access"])
                 self.assertIn("verified", spec)
 
-    def test_gemini_policy_denies_everything(self):
-        text = agent.GEMINI_POLICY.read_text()
-        self.assertIn('toolName = "*"', text)
-        self.assertIn('decision = "deny"', text)
-
-    def test_opencode_config_turns_every_tool_off(self):
-        self.assertTrue(agent.OPENCODE_NO_TOOLS["tools"])
-        self.assertFalse(any(agent.OPENCODE_NO_TOOLS["tools"].values()))
+    def test_opencode_config_denies_every_tool_by_catch_all(self):
+        self.assertEqual(agent.OPENCODE_NO_TOOLS["permission"], {"*": "deny"})
+        self.assertEqual(agent.OPENCODE_NO_TOOLS["tools"], {"*": False})
 
     def test_read_only_is_not_tool_free(self):
-        for name in ("crush", "codex", "cursor-agent", "grok", "copilot"):
+        for name in ("crush", "codex", "cursor-agent", "grok", "copilot", "gemini"):
             with self.subTest(agent=name):
                 self.assertIn(name, agent.UNSUPPORTED)
                 self.assertNotIn(name, agent.ADAPTERS)

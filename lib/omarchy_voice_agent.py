@@ -26,9 +26,12 @@ model's reply is spoken aloud and written to a cache. So an agent is in the
 table only when its CLI has a documented way to leave it with *no* tools,
 reads included. codex's read-only sandbox, cursor-agent's plan mode and
 grok's plan mode all keep file reads; grok's --tools "" is not documented
-as "none"; crush has no such flag at all; and copilot, with every tool it
+as "none"; crush has no such flag at all; copilot, with every tool it
 lists excluded and url access denied, still fetched a web page when asked
-to. None of those is an engine here.
+to; and gemini's deny-all policy rule, though documented to match every
+tool, could not be checked on this machine. None of those is an engine here.
+An agent joins the table when its tool-free form has been checked, by
+asking it to use a tool, or better, by reading the request it sends.
 They still work for "ask the agent to ..." - a deliberate handoff through
 `omarchy agent prompt`, started only on a sentence the user spoke - and
 `claude` answers instead when it is installed, with a note saying so.
@@ -51,16 +54,19 @@ import shutil
 import subprocess
 
 HERE = pathlib.Path(__file__).resolve().parent
-GEMINI_POLICY = HERE.parent / "config" / "gemini-no-tools.toml"
 
-# Every tool opencode knows, switched off. Written as the project config of
-# the directory the agent runs in, which opencode merges over the user's own
-# config - so their provider and model stay, and only the tools go.
+# opencode's catch-all permission rule, which it applies to every tool by
+# name - built-in, MCP server tools (registered under the server's name as a
+# prefix) and plugin tools alike - before the model is sent a single tool
+# definition. The deprecated `tools` map says the same thing a second way.
+# Delivered twice: as the project config of the directory the agent runs in,
+# and inline through OPENCODE_CONFIG_CONTENT, which opencode merges above the
+# project, custom and global configs - so nothing in the user's own config
+# can put a tool back.
 OPENCODE_NO_TOOLS = {
     "$schema": "https://opencode.ai/config.json",
-    "tools": {name: False for name in (
-        "bash", "read", "write", "edit", "patch", "glob", "grep", "list",
-        "webfetch", "websearch", "todowrite", "todoread", "task", "skill")},
+    "permission": {"*": "deny"},
+    "tools": {"*": False},
 }
 
 ADAPTERS = {
@@ -79,28 +85,16 @@ ADAPTERS = {
         "access": "no tools",
         "verified": True,
     },
-    # opencode merges the project config in its working directory over the
-    # user's; OPENCODE_NO_TOOLS is written there before every call. The
-    # `tools` map is documented in opencode's config schema. Not probed: the
-    # only opencode account here is its free tier, and that provider refuses
-    # a request once the tools are gone ("can only be used from within
-    # OpenCode"), so the probe never reached a model.
+    # Checked by pointing opencode at a local stand-in for a model endpoint
+    # and reading the tool definitions it sent. Unrestricted: bash, edit,
+    # glob, grep, read, skill, task, todowrite, webfetch, write, and - with
+    # an MCP server configured outside the project - that server's tool too.
+    # With the rule above: an empty list, in every request, MCP included.
     "opencode": {
         "argv": lambda p, m: ["opencode", "run", "--dir", str(workdir()), p],
         "envelope": "text",
-        "access": "no tools (project config)",
-        "verified": False,
-    },
-    # A user-tier policy rule that denies every tool. --approval-mode plan
-    # alone is not enough: gemini overrides it in a folder it does not trust,
-    # which the runtime directory is not. Flags verified to parse; the deny
-    # itself could not be exercised here (no Gemini account).
-    "gemini": {
-        "argv": lambda p, m: ["gemini", "-p", p, "--policy", str(GEMINI_POLICY),
-                              "--approval-mode", "plan"],
-        "envelope": "text",
-        "access": "no tools (policy)",
-        "verified": False,
+        "access": "no tools",
+        "verified": True,
     },
 }
 
@@ -112,6 +106,7 @@ UNSUPPORTED = {
     "hermes": "has no one-shot mode",
     "muse": "has no one-shot mode",
     "crush": "has no way to be asked without its tools",
+    "gemini": "has a deny-all policy file, but it could not be checked here",
     "copilot": "still reaches the network with every tool excluded and url denied",
     "codex": "keeps file reads and a shell even in its read-only sandbox",
     "cursor-agent": "keeps file reads in plan mode, and has no tool-free mode",
@@ -199,13 +194,16 @@ def ask(prompt, model=None, timeout=60):
 
     argv = ADAPTERS[agent]["argv"](prompt, model if agent == "claude" else None)
     assert not any(a in PERMISSIVE for a in argv), "a permissive flag reached an agent"
+    env = dict(os.environ)
+    if agent == "opencode":
+        env["OPENCODE_CONFIG_CONTENT"] = json.dumps(OPENCODE_NO_TOOLS)
     try:
         # stdin closed, never inherited. Several of these read stdin when it is
         # open and append it to the prompt, so an inherited terminal would have
         # them sitting there waiting for input that is never coming while the
         # user waits for an answer.
         proc = subprocess.run(argv, capture_output=True, text=True, cwd=cwd,
-                              timeout=timeout, stdin=subprocess.DEVNULL)
+                              env=env, timeout=timeout, stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
         return None, f"{agent} took too long"
     except OSError:

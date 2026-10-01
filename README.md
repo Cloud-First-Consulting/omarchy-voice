@@ -114,17 +114,17 @@ Two more:
 and a coding agent, which the two fallback tiers and the Omarchy manual call.
 Whichever one Omarchy is set to use is the one that answers:
 
-    omarchy default agent claude       # or gemini, opencode; the rest fall back to claude
+    omarchy default agent claude       # or opencode; the rest fall back to claude
 
-Three of the agents Omarchy supports can answer a single question without a
-terminal *and without their tools*, and are used directly: **claude, gemini**
-and **opencode**. The agent is only ever asked for words; see [The agent has
-no hands](#the-agent-has-no-hands). The other ten cannot be the engine here -
+Two of the agents Omarchy supports can answer a single question without a
+terminal *and without their tools*, and are used directly: **claude** and
+**opencode**. The agent is only ever asked for words; see [The agent has no
+hands](#the-agent-has-no-hands). The other eleven cannot be the engine here -
 pi, omp, openclaw, hermes and muse have no one-shot mode; codex, cursor-agent
 and grok keep file reads in their most restricted modes; crush has no
-restricted mode; copilot could not be shown to lose the network - so if one
-of those is your default the manual falls back to `claude` when it is
-installed and says so. Handing work off with "ask the
+restricted mode; copilot could not be shown to lose the network; gemini's
+deny-all policy could not be checked - so if one of those is your default the
+manual falls back to `claude` when it is installed and says so. Handing work off with "ask the
 agent to ..." works with all thirteen either way, because that is a
 deliberate, interactive launch through `omarchy agent`, which Omarchy maps
 itself.
@@ -492,7 +492,6 @@ places - one is a room full of people, the other is a meeting.
     lib/omarchy_voice_agent.py     which coding agent answers, and how to ask it with no tools
     lib/omarchy_voice_vet.py       the one boundary a model-composed command must pass
     tests/                         the boundary and the agent flags, as cases
-    config/gemini-no-tools.toml    the deny-all policy gemini is run with
     AGENTS.md                      notes for a coding agent working on this repo
     skills/omarchy-hotkeys/        so any agent answers key questions from this machine (opt-in)
     systemd/                       the user unit
@@ -615,20 +614,25 @@ instructions either. The reply is the only thing it can produce.
 | agent | how | leaves it able to | checked |
 |---|---|---|---|
 | claude | `--tools ""`, `--strict-mcp-config`, `--setting-sources ""` | nothing | asked to run `id` and to read a file: "NO TOOLS" to both |
-| gemini | `--policy config/gemini-no-tools.toml`, a `toolName = "*"` deny rule | nothing | the policy engine documents `*` as every tool; no account here to probe |
-| opencode | a project config in its working directory with every tool `false` | nothing | the `tools` map is documented; the free tier here refuses tool-less requests, so not probed |
+| opencode | `"permission": {"*": "deny"}`, as the project config it runs in and inline via `OPENCODE_CONFIG_CONTENT`, above every other config | nothing | pointed at a local stand-in for a model endpoint: unrestricted it sent ten tool definitions plus an MCP server's tool; with the rule, an empty list in every request |
 
-Those flags were each read out of the CLI's own documentation, and claude's
-were confirmed by asking it to use a tool and watching it say it could not.
+Those flags were each read out of the CLI's own documentation. claude's were
+confirmed by asking it to use a tool and watching it say it could not;
+opencode's by reading the request it makes to the model, which is the surer
+test, since a catch-all permission rule has to cover tools from MCP servers
+and plugins configured anywhere in the user's own config, not only the
+built-in ones a project config can name.
 Under the previous invocation Claude answered the same probe by *calling
 Bash* - which is what the review of this project caught, and why the table
 exists. "Read-only" does not qualify: a sandbox that still reads files lets a
 forged title pull a private file into the model's context, and the reply is
 spoken and cached. So codex (read-only sandbox keeps reads and a shell),
-cursor-agent and grok (plan mode keeps reads), crush (no restricted mode) and
+cursor-agent and grok (plan mode keeps reads), crush (no restricted mode),
 copilot (with every tool it lists excluded and url access denied, it still
-fetched a web page when asked) are not engines here. `tests/test_agent.py`
-keeps it that way.
+fetched a web page when asked) and gemini (its policy engine documents a
+deny-all rule, but it could not be checked here) are not engines here. An
+agent joins the table when its tool-free form has been checked, and
+`tests/test_agent.py` keeps it that way.
 
 ### One boundary, by shape
 
