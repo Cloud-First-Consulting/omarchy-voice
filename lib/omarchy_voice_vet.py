@@ -222,12 +222,32 @@ def _curl(argv):
             continue
         if arg.startswith("-"):
             return f"curl option {arg} is not allowed"
-        if "://" in arg and not _http(arg):
-            return f"curl may only fetch http(s), not {arg}"
-        if arg.startswith(("/", ".", "~", "@")):
-            return f"curl may only fetch a URL, not the path {arg}"
+        # The target must say http:// or https:// itself. Anything else is
+        # left to curl to interpret, and curl interprets generously: a bare
+        # host is guessed (ftp.example.com becomes FTP), and the single-slash
+        # file:/home/me/.ssh/id_ed25519 is a FILE URL by its own URL syntax,
+        # with no "://" in it to notice.
+        if not _http(arg):
+            return f"curl may only fetch an explicit http(s) URL, not {arg}"
+        if target:
+            return "curl may fetch one URL"
         target = True
     return None if target else "curl needs a URL"
+
+
+# What a vetted argv is actually run as. The vet decides whether a command
+# may run; this is the second lock on the one program that interprets its
+# arguments as freely as curl does: -q ignores ~/.curlrc, --proto limits the
+# scheme curl will use even if an argument slipped past, --proto-redir does
+# the same for anything a redirect points at.
+CURL_HARDENING = ["-q", "--proto", "=http,https", "--proto-redir", "=http,https"]
+
+
+def harden(argv):
+    """The argv to execute for a vetted command."""
+    if argv and argv[0] == "curl":
+        return [argv[0], *CURL_HARDENING, *argv[1:]]
+    return list(argv)
 
 
 def _hyprctl(argv):

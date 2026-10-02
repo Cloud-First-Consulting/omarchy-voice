@@ -684,9 +684,16 @@ command. Flags are accepted only where a shape names them:
 - **date / cal / du / df / ip / notify-send** - the few flags a spoken
   question needs. No `date -f <file>`, `du --files0-from`, `ip -batch` or
   anything else that reads a file into the output.
-- **curl** - a plain GET of an http(s) URL. `-sO` bundles into a single
-  argument no exact-match rule sees, `-T` is `--upload-file`, `-K` reads any
-  option at all from a file; allowing only what a GET needs ends the category.
+- **curl** - a plain GET of one URL that itself begins `http://` or
+  `https://`. `-sO` bundles into a single argument no exact-match rule sees,
+  `-T` is `--upload-file`, `-K` reads any option at all from a file, and a
+  target without an explicit scheme is left to curl to guess - a bare
+  `ftp.example.com` becomes FTP, and the single-slash `file:/home/me/.ssh/
+  id_ed25519` is a FILE URL by curl's own syntax with no `://` to notice.
+  Allowing only what a GET of an explicit URL needs ends the category, and
+  the command is then run with `-q --proto =http,https --proto-redir
+  =http,https` so curl enforces the same scheme limit itself, including on
+  anything a redirect points at.
 - **xdg-open** and **omarchy-voice-browser** - http(s) URLs only. The wrapper
   checks again itself, so the rule holds even if it is reached another way.
 

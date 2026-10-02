@@ -263,7 +263,7 @@ def main():
                 return 1
         for argv in commands:
             print(f"  running {' '.join(argv)}")
-            subprocess.run(argv, check=False)
+            subprocess.run(vetting.harden(argv), check=False)
     return 0
 
 

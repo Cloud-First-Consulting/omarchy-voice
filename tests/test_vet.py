@@ -10,7 +10,7 @@ import sys
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib"))
-from omarchy_voice_vet import vet  # noqa: E402
+from omarchy_voice_vet import vet, harden  # noqa: E402
 
 ALLOWED = [
     ["omarchy", "launch", "browser", "https://news.ycombinator.com"],
@@ -55,7 +55,7 @@ ALLOWED = [
     ["bluetoothctl", "power", "off"],
     ["voxtype", "record", "toggle"],
     ["xdg-open", "https://omarchy.org"],
-    ["curl", "-s", "wttr.in/?format=3"],
+    ["curl", "-s", "https://wttr.in/?format=3"],
     ["curl", "-sSL", "https://wttr.in/London?format=3"],
     ["curl", "--max-time", "5", "https://wttr.in/?format=3"],
     ["date"], ["cal"], ["uptime"], ["free", "-h"], ["df", "-h", "/"],
@@ -188,6 +188,15 @@ REFUSED = [
     ["curl", "file:///etc/passwd"],
     ["curl", "/etc/passwd"],
     ["curl", "-s"],
+    ["curl", "-s", "wttr.in/?format=3"],
+    ["curl", "-s", "file:/home/me/.ssh/id_ed25519"],
+    ["curl", "-s", "FILE:/etc/passwd"],
+    ["curl", "-s", "ftp.example.com/x"],
+    ["curl", "-s", "https://wttr.in/?format=3", "file:/etc/passwd"],
+    ["curl", "-s", "https://a.example", "https://b.example"],
+    ["curl", "-s", "smb://evil/share"],
+    ["curl", "-s", "gopher://evil/"],
+    ["curl", "-s", "dict://localhost/"],
     # the rest
     ["ip", "link", "set", "wlan0", "down"],
     ["ip", "route", "add", "default", "via", "10.0.0.1"],
@@ -261,6 +270,12 @@ class Boundary(unittest.TestCase):
         for argv in REFUSED:
             with self.subTest(argv=argv):
                 self.assertIsNotNone(vet(argv), f"wrongly allowed: {argv}")
+
+    def test_curl_runs_with_its_scheme_pinned(self):
+        argv = harden(["curl", "-s", "https://wttr.in/?format=3"])
+        self.assertEqual(argv[:6], ["curl", "-q", "--proto", "=http,https", "--proto-redir", "=http,https"])
+        self.assertEqual(argv[6:], ["-s", "https://wttr.in/?format=3"])
+        self.assertEqual(harden(["date"]), ["date"])
 
     def test_reason_is_short_and_speakable(self):
         for argv in REFUSED:

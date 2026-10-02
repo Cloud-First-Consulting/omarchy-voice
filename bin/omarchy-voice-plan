@@ -93,7 +93,7 @@ hyprctl dispatch fullscreen
 hyprctl eval "hl.config({ cursor = { zoom_factor = 1.5 } })"   screen zoom
 playerctl play-pause|next|previous
 wpctl set-volume|set-mute <id> ...
-curl -s "wttr.in/?format=3"       one-line weather here (geolocates by IP;
+curl -s "https://wttr.in/?format=3"   one-line weather here (geolocates by IP;
                                   add a place only if the user named one)
 date, cal, uptime, free -h, df -h /   quick system facts
 systemctl --user start|stop omarchy-voice-wake   the wake word listener\
@@ -525,7 +525,7 @@ def execute(commands, say, text, key=None):
             speak(reason)
             return False
     for argv in commands:
-        failure = spawn(argv)
+        failure = spawn(vetting.harden(argv))
         if failure:
             log("failed to start %s: %s", " ".join(argv), failure)
             notify("That didn't work", f"{' '.join(argv)[:80]}: {failure}"[:160], "󰀦")
@@ -558,7 +558,7 @@ def report(argv, say, text, key=None):
         speak(reason)
         return False
     try:
-        proc = run(argv, capture=True)
+        proc = run(vetting.harden(argv), capture=True)
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
         log("failed to run %s: %s", " ".join(argv), exc)
         notify("That didn't work", str(exc)[:120], "󰀦")
