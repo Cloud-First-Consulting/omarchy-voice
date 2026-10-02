@@ -17,7 +17,10 @@
 
 set -uo pipefail
 
-RUN_DIR="${XDG_RUNTIME_DIR:-/tmp/omarchy-voice-$(id -u)}/omarchy-voice"
+# The private runtime directory, established or refused: see lib/omarchy-voice-rundir.sh.
+# shellcheck source=../lib/omarchy-voice-rundir.sh
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/omarchy-voice-rundir.sh"
+RUN_DIR=$(omarchy_voice_run_dir) || exit 1
 WAV="$RUN_DIR/command.wav"
 PID_FILE="$RUN_DIR/record.pid"
 LAST="$RUN_DIR/last.txt"
@@ -91,7 +94,6 @@ recording_pid() {
 }
 
 start() {
-  mkdir -p "$RUN_DIR" && chmod 700 "$RUN_DIR"
   recording_pid >/dev/null && return 0
 
   # 16 kHz mono is what whisper wants; anything else just costs a resample.
@@ -515,6 +517,6 @@ case "${1:-toggle}" in
     ;;
   last) cat "$LAST" 2>/dev/null ;;
   text) shift; dispatch "$*" ;;
-  file) mkdir -p "$RUN_DIR" && chmod 700 "$RUN_DIR"; transcribe_and_dispatch "${2:?usage: omarchy-voice-command file <wav>}" ;;
+  file) transcribe_and_dispatch "${2:?usage: omarchy-voice-command file <wav>}" ;;
   *) echo "usage: omarchy-voice-command [start|stop|toggle|cancel|last|text <phrase>|file <wav>]" >&2; exit 1 ;;
 esac

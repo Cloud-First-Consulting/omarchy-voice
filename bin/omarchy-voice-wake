@@ -49,6 +49,10 @@ import json
 import logging
 import os
 import pathlib
+import sys
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib"))
+from omarchy_voice_rundir import run_dir  # noqa: E402
+import pathlib
 import signal
 import subprocess
 import sys
@@ -85,6 +89,7 @@ CHUNK = FRAME * 2  # bytes
 CONFIG = pathlib.Path.home() / ".config/omarchy/voice-wake.json"
 WAKE_DIR = pathlib.Path.home() / ".local/share/omarchy-wakeword"
 RUN_DIR = pathlib.Path(os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/omarchy-voice-{os.getuid()}") / "omarchy-voice"
+# The path above is only a name; run_dir() is what establishes that it is ours.
 
 DEFAULTS = {
     "wake_words": ["hey marvin"],  # only the name is read from this now
@@ -327,12 +332,7 @@ STATE = RUN_DIR / "state.json"
 def write_state(**fields):
     """Record the listener's current state for anything watching it."""
     try:
-        RUN_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-        # Private, and so is the fallback parent under /tmp when there is no
-        # XDG_RUNTIME_DIR: recordings and transcripts live here.
-        os.chmod(RUN_DIR, 0o700)
-        if RUN_DIR.parent.name.startswith("omarchy-voice-"):
-            os.chmod(RUN_DIR.parent, 0o700)
+        run_dir()  # ours and private, or OSError before anything is written
         current = {}
         if STATE.exists():
             try:
@@ -487,12 +487,7 @@ def dispatch(audio, followup_secs=0.0):
         return
 
     try:
-        RUN_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-        # Private, and so is the fallback parent under /tmp when there is no
-        # XDG_RUNTIME_DIR: recordings and transcripts live here.
-        os.chmod(RUN_DIR, 0o700)
-        if RUN_DIR.parent.name.startswith("omarchy-voice-"):
-            os.chmod(RUN_DIR.parent, 0o700)
+        run_dir()  # ours and private, or OSError before anything is written
         path = RUN_DIR / "wake-command.wav"
         with wave.open(str(path), "wb") as wav:
             wav.setnchannels(1)
@@ -502,9 +497,11 @@ def dispatch(audio, followup_secs=0.0):
         logging.info("dispatching %.1fs of audio", len(audio) / (RATE * 2))
         threading.Thread(target=run_command, args=(path, followup_secs),
                          daemon=True).start()
-    except (OSError, RuntimeError, wave.Error):
+    except (OSError, RuntimeError, wave.Error) as exc:
         _in_flight.release()
-        raise
+        logging.error("not recording: %s", exc)
+        notify("Not recording", str(exc)[:160], "\U000f0028")
+        return
 
 
 def main():

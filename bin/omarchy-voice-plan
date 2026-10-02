@@ -36,6 +36,7 @@ import tempfile
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib"))
 import omarchy_voice_agent as agent  # noqa: E402
 import omarchy_voice_vet as vetting  # noqa: E402
+from omarchy_voice_rundir import run_dir  # noqa: E402
 
 MODEL = os.environ.get("OMARCHY_VOICE_MODEL", "haiku")
 TIMEOUT = int(os.environ.get("OMARCHY_VOICE_TIMEOUT", "60"))
@@ -269,6 +270,7 @@ def notify(title, body, icon="󰚩", timeout=6000):
 def load_history():
     """Recent turns, newest last, dropping anything too old to be a follow-up."""
     try:
+        run_dir()  # read only from a directory that is ours
         turns = json.loads(HISTORY.read_text())
     except (OSError, json.JSONDecodeError):
         return []
@@ -285,12 +287,7 @@ def remember_turn(said, reply):
     turns = load_history()
     turns.append({"at": datetime.datetime.now().timestamp(), "said": said, "reply": reply})
     try:
-        HISTORY.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        # Private, and so is the fallback parent under /tmp when there is no
-        # XDG_RUNTIME_DIR: recordings and transcripts live here.
-        os.chmod(HISTORY.parent, 0o700)
-        if HISTORY.parent.parent.name.startswith("omarchy-voice-"):
-            os.chmod(HISTORY.parent.parent, 0o700)
+        run_dir()  # ours and private, or OSError and nothing is written
         HISTORY.write_text(json.dumps(turns[-HISTORY_TURNS:]))
     except OSError:
         pass  # remembering is a convenience, never a reason to fail a command

@@ -495,6 +495,8 @@ places - one is a room full of people, the other is a meeting.
     lib/omarchy_voice_ui.py        the animated progress notification, shared
     lib/omarchy_voice_agent.py     which coding agent answers, and how to ask it with no tools
     lib/omarchy_voice_vet.py       the one boundary a model-composed command must pass
+    lib/omarchy_voice_rundir.py    the private runtime directory, established or refused
+    lib/omarchy-voice-rundir.sh    the same, for the shell scripts
     tests/                         the boundary and the agent flags, as cases
     AGENTS.md                      notes for a coding agent working on this repo
     skills/omarchy-hotkeys/        so any agent answers key questions from this machine (opt-in)
@@ -702,6 +704,21 @@ command. Flags are accepted only where a shape names them:
 
 The table is small on purpose and grows only when a real request needed it,
 with a test case first.
+
+### The runtime directory is ours or it is not used
+
+Recordings, the last transcript, the conversation history and the listener's
+state live in `$XDG_RUNTIME_DIR/omarchy-voice`, which is private because the
+runtime directory is. Without that variable the fallback is
+`/tmp/omarchy-voice-<uid>`, and a name is not ownership: another local user
+can create that path first. So every script that writes there - and the ones
+that read there - go through one helper (`lib/omarchy-voice-rundir.sh` for
+shell, `lib/omarchy_voice_rundir.py` for Python) that creates each level
+mode 700 if absent and then checks it: a real directory, not a symlink,
+owned by this user, mode 700 after a chmod that must succeed. Anything else
+is refused, and the caller stops before it records, transcribes or writes.
+`tests/test_rundir.py` covers the symlink, the file in the way, the loose
+mode and the fallback, for both helpers.
 
 ### A window title is not an instruction
 

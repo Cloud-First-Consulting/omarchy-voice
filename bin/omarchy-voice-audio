@@ -44,6 +44,9 @@ spoken to is not the same as not wanting to be heard.
 import array
 import json
 import os
+import sys
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib"))
+from omarchy_voice_rundir import run_dir  # noqa: E402
 import pathlib
 import subprocess
 import sys
@@ -190,6 +193,7 @@ def config():
 
 def state():
     try:
+        run_dir()  # read only from a directory that is ours
         return json.loads(STATE.read_text())
     except (OSError, json.JSONDecodeError):
         return {}

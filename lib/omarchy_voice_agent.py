@@ -56,6 +56,8 @@ import pathlib
 import shutil
 import subprocess
 
+from omarchy_voice_rundir import private_dir, run_dir
+
 HERE = pathlib.Path(__file__).resolve().parent
 
 ADAPTERS = {
@@ -104,15 +106,9 @@ PERMISSIVE = {
 
 
 def workdir():
-    """An empty directory of our own for the agent to run in."""
-    base = pathlib.Path(os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/omarchy-voice-{os.getuid()}")
-    path = base / "omarchy-voice" / "agent"
-    path.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chmod(path, 0o700)
-    except OSError:
-        pass
-    return path
+    """An empty directory of our own for the agent to run in, inside the
+    private runtime directory (see omarchy_voice_rundir)."""
+    return private_dir(run_dir() / "agent")
 
 
 def configured():

@@ -29,6 +29,9 @@ is worth knowing before it happens rather than after.
 import argparse
 import json
 import os
+import sys
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib"))
+from omarchy_voice_rundir import run_dir  # noqa: E402
 import pathlib
 import subprocess
 import sys
@@ -174,7 +177,10 @@ def main():
         print(f"{peak:.3f} peak, held {held} frames  {args.wav}")
         return 0
 
-    tmp = LAST_WAV.parent / "wake-test.wav"
+    try:
+        tmp = run_dir() / "wake-test.wav"
+    except OSError as exc:
+        sys.exit(f"omarchy-voice-wake-test: {exc}")
     print(f"model            {name}")
     print(f"threshold        {threshold}")
     print(f"frames to wake   {wake_frames}\n")
