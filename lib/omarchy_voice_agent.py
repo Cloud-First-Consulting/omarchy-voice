@@ -61,17 +61,26 @@ from omarchy_voice_rundir import private_dir, run_dir
 HERE = pathlib.Path(__file__).resolve().parent
 
 ADAPTERS = {
-    # --tools "" removes every built-in tool; --strict-mcp-config with no
-    # --mcp-config removes every MCP server; --setting-sources "" ignores the
-    # settings files that could add either back. Asked to run `id` with Bash
-    # and to read a file with Read, it answered "NO TOOLS" to both.
+    # --tools "" removes every built-in tool; --restricted removes the ones
+    # that run code or fetch and ignores the user's settings files as well;
+    # --strict-mcp-config with no --mcp-config removes every MCP server;
+    # --setting-sources "" ignores the settings files that could add any of
+    # it back; --permission-mode manual refuses anything that would still
+    # ask. Asked to run `id` with Bash and to read a file with Read, it
+    # answered "NO TOOLS" to both.
     "claude": {
         "argv": lambda p, m: ["claude", "-p", p, "--output-format", "json",
-                              "--max-turns", "1", "--tools", "",
+                              "--max-turns", "1", "--restricted", "--tools", "",
                               "--strict-mcp-config", "--setting-sources", "",
+                              "--permission-mode", "manual",
                               "--no-session-persistence",
                               "--disable-slash-commands"]
                              + (["--model", m] if m else []),
+        # The flags the invocation depends on. If the installed CLI does not
+        # list every one of them, it is not asked at all - never asked in a
+        # looser form.
+        "required_flags": ("--restricted", "--tools", "--strict-mcp-config",
+                           "--setting-sources", "--permission-mode"),
         "envelope": "json",
         "access": "no tools",
         "verified": True,
@@ -154,11 +163,31 @@ def resolve():
     return None, f"{chosen} is not installed"
 
 
+_flags_ok = {}
+
+
+def supports_required_flags(agent):
+    """True if the installed CLI's own --help lists every flag the tool-free
+    invocation relies on. Checked once per process."""
+    if agent not in _flags_ok:
+        needed = ADAPTERS[agent].get("required_flags", ())
+        try:
+            out = subprocess.run([agent, "--help"], capture_output=True, text=True,
+                                 timeout=20, stdin=subprocess.DEVNULL)
+            text = (out.stdout or "") + (out.stderr or "")
+        except (OSError, subprocess.TimeoutExpired):
+            text = ""
+        _flags_ok[agent] = all(flag in text for flag in needed)
+    return _flags_ok[agent]
+
+
 def ask(prompt, model=None, timeout=60):
     """Put one question to the agent. Returns (reply_text, error)."""
     agent, note = resolve()
     if agent is None:
         return None, note
+    if not supports_required_flags(agent):
+        return None, f"{agent} is installed but does not offer the flags needed to ask it without tools; not asking"
 
     cwd = workdir()
     argv = ADAPTERS[agent]["argv"](prompt, model if agent == "claude" else None)

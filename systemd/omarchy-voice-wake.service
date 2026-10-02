@@ -14,6 +14,11 @@ ExecStart=%h/.local/share/omarchy-wakeword/venv/bin/python %h/.local/bin/omarchy
 Restart=on-failure
 RestartSec=2
 Nice=5
+# Recordings and transcripts: nothing this writes is for anyone else.
+UMask=0077
+NoNewPrivileges=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
 
 [Install]
 WantedBy=default.target

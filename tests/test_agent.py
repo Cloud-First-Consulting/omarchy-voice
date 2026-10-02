@@ -15,7 +15,8 @@ import omarchy_voice_agent as agent  # noqa: E402
 
 # What each adapter must say to its CLI to withhold tools.
 REQUIRED = {
-    "claude": [("--tools", ""), ("--strict-mcp-config",), ("--setting-sources", ""),
+    "claude": [("--tools", ""), ("--restricted",), ("--strict-mcp-config",),
+               ("--setting-sources", ""), ("--permission-mode", "manual"),
                ("--max-turns", "1")],
 }
 
@@ -55,6 +56,14 @@ class ToolFree(unittest.TestCase):
             with self.subTest(agent=name):
                 self.assertTrue(spec["access"])
                 self.assertIn("verified", spec)
+
+    def test_required_flags_are_declared_and_present(self):
+        for name, spec in agent.ADAPTERS.items():
+            argv = spec["argv"]("hello", None)
+            with self.subTest(agent=name):
+                self.assertTrue(spec.get("required_flags"))
+                for flag in spec["required_flags"]:
+                    self.assertIn(flag, argv)
 
     def test_read_only_is_not_tool_free(self):
         for name in ("crush", "codex", "cursor-agent", "grok", "copilot", "gemini", "opencode"):

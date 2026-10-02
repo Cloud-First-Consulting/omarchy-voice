@@ -168,12 +168,14 @@ system interpreter, so it still runs by hand and from a keybinding.
 
     mkdir -p ~/.local/share/piper/voices
     cd ~/.local/share/piper/voices
-    base=https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_GB/alan/medium
+    base=https://huggingface.co/rhasspy/piper-voices/resolve/c10ece1aade47bb51c153c893d14e5bf8e5b7117/en/en_GB/alan/medium
     curl -sLO $base/en_GB-alan-medium.onnx
     curl -sLO $base/en_GB-alan-medium.onnx.json
 
-Both files are needed - piper reads the `.json` for the phoneme table. Any other
-piper voice works; put its name in `voice` in the config.
+Both files are needed - piper reads the `.json` for the phoneme table. The
+URL names a fixed revision of the voices repository rather than `main`, so
+the files you fetch are the ones this was tested with. Any other piper voice
+works; put its name in `voice` in the config.
 
 ### 3. This repo
 
@@ -598,6 +600,9 @@ check reporting a working microphone fallback as a hard failure. Both would have
 trained you to ignore them.
 
 ## Safety
+
+[SECURITY.md](SECURITY.md) maps what this plugin writes, runs and contacts to
+the marketplace's capability names, in one page. This section is the reasoning.
 
 Three scripts run commands a language model composed: the planner, `--run` on
 the Omarchy manual, and `--fix` on the diagnoser. All three go through one

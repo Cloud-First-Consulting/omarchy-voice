@@ -60,6 +60,8 @@ class Progress:
         self.label = label
 
     def _send(self, glyph, title, body, timeout="120000"):
+        title = "".join(c for c in str(title) if c.isprintable())[:120]
+        body = "".join(c for c in str(body) if c.isprintable() or c == "\n")[:600]
         if not (self.enabled and self.id):
             return
         try:

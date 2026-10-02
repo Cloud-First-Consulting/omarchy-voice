@@ -195,6 +195,11 @@ is read by a speech engine, so words rather than symbols and no markdown.\
 
 
 def notify(title, body, icon="󰀦", timeout=10000):
+    # Model or transcript text ends up here. Control and format characters
+    # (bidi overrides, zero-width) are dropped so a payload cannot redraw or
+    # retitle the notification; both strings are bounded.
+    title = "".join(c for c in str(title) if c.isprintable())[:120]
+    body = "".join(c for c in str(body) if c.isprintable() or c == "\n")[:600]
     try:
         subprocess.run(["omarchy-notification-send", "-g", icon, title, body,
                         "-t", str(timeout)], check=False,

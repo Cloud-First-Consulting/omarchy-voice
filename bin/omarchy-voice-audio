@@ -45,12 +45,11 @@ import array
 import json
 import os
 import sys
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib"))
-from omarchy_voice_rundir import run_dir  # noqa: E402
 import pathlib
 import subprocess
-import sys
 import time
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib"))
+from omarchy_voice_rundir import run_dir  # noqa: E402
 
 CONFIG = pathlib.Path.home() / ".config/omarchy/voice-wake.json"
 LEVELS = pathlib.Path.home() / ".local/share/omarchy/voice-mic-levels.json"

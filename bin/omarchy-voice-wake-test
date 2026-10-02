@@ -30,12 +30,11 @@ import argparse
 import json
 import os
 import sys
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib"))
-from omarchy_voice_rundir import run_dir  # noqa: E402
 import pathlib
 import subprocess
-import sys
 import wave
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib"))
+from omarchy_voice_rundir import run_dir  # noqa: E402
 
 VENV = pathlib.Path.home() / ".local/share/omarchy-wakeword/venv/bin/python"
 try:

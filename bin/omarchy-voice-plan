@@ -243,6 +243,23 @@ def speak(text):
         log("could not speak: %s", exc)
 
 
+_log_transcripts = None
+
+
+def shown(text):
+    """What a transcript or an output looks like in the journal: itself only
+    when log_transcripts is set in voice-wake.json, otherwise its length."""
+    global _log_transcripts
+    if _log_transcripts is None:
+        try:
+            _log_transcripts = bool(json.loads(CONFIG.read_text()).get("log_transcripts"))
+        except (OSError, ValueError, AttributeError):
+            _log_transcripts = False
+    if _log_transcripts:
+        return repr(text)
+    return f"<{len(str(text))} chars; set log_transcripts to see>"
+
+
 def log(message, *args):
     """One line to stderr per decision.
 
@@ -257,6 +274,11 @@ def log(message, *args):
 
 
 def notify(title, body, icon="󰚩", timeout=6000):
+    # Model or transcript text ends up here. Control and format characters
+    # (bidi overrides, zero-width) are dropped so a payload cannot redraw or
+    # retitle the notification; both strings are bounded.
+    title = "".join(c for c in str(title) if c.isprintable())[:120]
+    body = "".join(c for c in str(body) if c.isprintable() or c == "\n")[:600]
     try:
         subprocess.run(
             ["omarchy-notification-send", "-g", icon, title, body, "-t", str(timeout)],
@@ -397,7 +419,7 @@ def recall(key):
     if any(vet(argv) for argv in commands):
         return None
     if matched != key:
-        log("matched %r to what was learned for %r", key, matched)
+        log("matched %s to what was learned for %s", shown(key), shown(matched))
     return entry
 
 
@@ -516,7 +538,7 @@ def spawn(argv, grace=0.25):
 def execute(commands, say, text, key=None):
     """Vet, then start, every command in a plan. Returns True if all of it ran."""
     if not commands:
-        log("plan had no commands for %r", text)
+        log("plan had no commands for %s", shown(text))
         notify("Couldn't work that out", f"“{text}”", "󰀦")
         return False
     for argv in commands:
@@ -537,11 +559,11 @@ def execute(commands, say, text, key=None):
     notify(say, f"“{text}”", "󰄬")
     if key:
         remember(key, say, commands)
-        log("learned %r", key)
+        log("learned %s", shown(key))
     else:
         # Silent before, and the exact reason a command could run correctly and
         # still never be remembered - with nothing anywhere to say so.
-        log("no normalized key, so not learning %r", text)
+        log("no normalized key, so not learning %s", shown(text))
     return True
 
 
@@ -568,14 +590,14 @@ def report(argv, say, text, key=None):
         return False
 
     output = (proc.stdout or proc.stderr or "").strip()
-    log("ran %s -> %r", " ".join(argv), output[:80])
+    log("ran %s -> %s", " ".join(argv), shown(output[:80]))
     notify(say, output[:300] if output else "(no output)", "󰚩", 12000)
     # The answer is the output, not the "checking the weather" that preceded it,
     # so that is what gets read out - unless it is a table, which is unlistenable.
     speak(speakable(output) or say)
     if key:
         remember(key, say, [argv], kind="report")
-        log("learned %r", key)
+        log("learned %s", shown(key))
     return True
 
 
@@ -621,7 +643,7 @@ def main():
 
     # Said this before? Then it has already been worked out once, and asking
     # again would buy nothing but a few seconds of latency.
-    log("heard %r (key %r)", text, key)
+    log("heard %s (key %s)", shown(text), shown(key))
 
     history = load_history()
     if history:
@@ -655,9 +677,10 @@ def main():
     # wording alone: "close them" resolves only against the turn before it, and
     # replaying that later, cold, would act on whatever happened to be open.
     if history:
-        log("context-dependent, so not learning %r", key)
+        log("context-dependent, so not learning %s", shown(key))
         key = None
-    log("plan %s: %s", kind, json.dumps(plan.get("commands") or plan.get("command") or plan.get("say", ""), ensure_ascii=False))
+    log("plan %s: %s", kind, json.dumps(plan.get("commands") or plan.get("command"), ensure_ascii=False)
+        if (plan.get("commands") or plan.get("command")) else shown(plan.get("say", "")))
 
     if dry:
         print(json.dumps(plan, ensure_ascii=False))
