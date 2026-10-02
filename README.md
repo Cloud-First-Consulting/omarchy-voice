@@ -269,9 +269,12 @@ room where you would rather not leave a microphone open.
 `uninstall.sh` stops and disables the listener, removes the user unit, takes
 the icon out of the bar, and removes every link `install.sh` made, including
 any skill links - and only links that point into this clone, so a same-named
-script or skill from somewhere else is left alone. The same goes for the unit:
-one that `install.sh` did not write is neither stopped nor removed, and one you
-have edited since is disabled but kept. Your config and what it has learned stay unless you pass
+script or skill from somewhere else is left alone. The same goes for the
+plugin registration: the widget is disabled and its link removed only when
+that link resolves to this clone, and a link to another clone of the plugin
+is kept, widget and all. And for the unit: one that `install.sh` did not
+write is neither stopped nor removed, and one you have edited since is
+disabled but kept. Your config and what it has learned stay unless you pass
 `--purge`, which also removes `~/.config/omarchy/voice-wake.json`, the learned
 phrase cache and the cached Omarchy reference.
 

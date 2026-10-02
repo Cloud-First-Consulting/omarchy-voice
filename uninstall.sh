@@ -81,18 +81,32 @@ for skill in "$REPO"/skills/*/; do
   done
 done
 
-# The bar widget. Disable it so the shell stops loading it, then remove the
-# plugin directory only if it is our link. A clone made by `omarchy plugin add`
-# is the directory this script is running from, and deleting the running script's
-# own directory is the shell's job: `omarchy plugin remove` does it cleanly.
+# The bar widget. The plugin directory is touched only if it is *this* clone:
+# a link whose target resolves to this clone is unlinked, and the widget is
+# disabled first so the shell stops loading it; a link to some other clone
+# of the same plugin is somebody else's registration and is kept, widget and
+# all, exactly as install.sh keeps it. A real directory is a clone made by
+# `omarchy plugin add`; if it is the one this script runs from, finishing is
+# the shell's job (`omarchy plugin remove`), because deleting the running
+# script's own directory is not. Any other directory is not ours.
 id=$(jq -r '.id' "$REPO/manifest.json" 2>/dev/null)
 if [[ -n $id ]]; then
-  omarchy plugin disable "$id" >/dev/null 2>&1 && echo "  disabled bar widget $id"
-  if [[ -L $PLUGIN_DIR/$id ]]; then
-    rm -f "$PLUGIN_DIR/$id"
-    echo "  unlinked plugin $id"
-  elif [[ -d $PLUGIN_DIR/$id ]]; then
-    echo "  plugin directory is a clone; finish with: omarchy plugin remove $id --yes"
+  reg="$PLUGIN_DIR/$id"
+  if [[ -L $reg ]]; then
+    if [[ $(readlink -f "$reg") == "$REPO" ]]; then
+      omarchy plugin disable "$id" >/dev/null 2>&1 && echo "  disabled bar widget $id"
+      rm -f "$reg"
+      echo "  unlinked plugin $id"
+    else
+      echo "  kept $reg: a link to a different clone, not this one"
+    fi
+  elif [[ -d $reg ]]; then
+    if [[ $(readlink -f "$reg") == "$REPO" ]]; then
+      omarchy plugin disable "$id" >/dev/null 2>&1 && echo "  disabled bar widget $id"
+      echo "  plugin directory is this clone; finish with: omarchy plugin remove $id --yes"
+    else
+      echo "  kept $reg: a different installation of $id, not this clone"
+    fi
   fi
 fi
 
