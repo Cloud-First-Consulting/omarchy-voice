@@ -175,8 +175,6 @@ HYPRCTL_ZOOM = re.compile(
 SYSTEMCTL_VERBS = {"start", "stop", "restart", "status", "is-active", "is-enabled"}
 UNIT_NAME = re.compile(r"^[A-Za-z0-9@._-]+$")
 
-NMCLI_READ = {("general",), ("device",), ("dev",), ("connection", "show"),
-              ("con", "show"), ("radio",), ("networking",)}
 PACTL_VERBS = {"set-sink-volume", "set-sink-mute", "set-source-volume",
                "set-source-mute", "set-default-sink", "set-default-source",
                "get-sink-volume", "get-sink-mute", "get-source-volume",
@@ -266,24 +264,36 @@ def _systemctl(argv):
     return None
 
 
+# nmcli accepts any unambiguous abbreviation of an option or a command, in
+# any position: `--show-secret` after a connection id prints the Wi-Fi PSK as
+# surely as `-s` before it, and `c s` is `connection show`. So there is no
+# denylist here. These are the exact shapes a spoken question needs, token
+# for token; an option is accepted only where a shape names it, spelt out in
+# full, and nothing may follow a shape.
+NMCLI_SHAPES = [
+    ["general", "status"],
+    ["general"],
+    ["networking"],
+    ["device", "status"],
+    ["device"],
+    ["device", "wifi", "list"],
+    ["device", "wifi", "rescan"],
+    ["device", "wifi"],
+    ["connection", "show"],
+    ["connection", "show", "--active"],
+    ["radio"],
+    ["radio", "wifi"], ["radio", "wifi", "on"], ["radio", "wifi", "off"],
+    ["radio", "all"], ["radio", "all", "on"], ["radio", "all", "off"],
+]
+
+
 def _nmcli(argv):
-    rest = argv[1:]
-    if any(a in {"-s", "--show-secrets", "-a", "--ask"} for a in rest):
-        return "network secrets are not available to voice"
-    while rest and rest[0] in {"-t", "--terse", "-p", "--pretty", "-c", "--colors"}:
+    rest = list(argv[1:])
+    if rest[:1] in (["-t"], ["--terse"]):
         rest = rest[1:]
-    if rest and rest[0] in {"-f", "--fields"}:
-        rest = rest[2:]
-    for shape in NMCLI_READ:
-        if tuple(rest[:len(shape)]) == shape:
-            if shape[0] in {"device", "dev"} and rest[1:2] not in ([], ["status"], ["show"], ["wifi"]):
-                return f"nmcli device {rest[1]} is not available to voice"
-            if shape[0] in {"device", "dev"} and rest[1:2] == ["wifi"] and rest[2:3] not in ([], ["list"], ["rescan"]):
-                return "nmcli may only list or rescan wifi"
-            if shape[0] == "radio" and rest[1:2] not in ([], ["wifi"], ["wwan"], ["all"]):
-                return f"nmcli radio {rest[1]} is not available to voice"
-            return None
-    return "nmcli may only read network state or switch a radio"
+    if rest in NMCLI_SHAPES:
+        return None
+    return "nmcli may only report network state or switch a radio, in a fixed form"
 
 
 def vet(argv):

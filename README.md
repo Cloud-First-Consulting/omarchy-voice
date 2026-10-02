@@ -671,8 +671,13 @@ command. Flags are accepted only where a shape names them:
   one `eval`: the screen-zoom expression, matched as a whole.
 - **systemctl** - `--user` only, start/stop/restart/status of one unit named
   without a path. No enable, link, edit or environment changes.
-- **nmcli** - reading state and switching a radio. No secrets (`-s`), no
-  adding, changing or deleting connections.
+- **nmcli** - a fixed list of exact token sequences: `general status`,
+  `device status`, `device wifi list|rescan`, `connection show [--active]`,
+  `radio wifi|all [on|off]`, optionally after `-t`. No other option in any
+  position, because nmcli accepts any unambiguous abbreviation anywhere -
+  `--show-secret` after a connection id prints the Wi-Fi PSK as surely as
+  `-s` before it - so a denylist of spellings cannot hold. No connection id,
+  no field selection, no adding, changing or deleting connections.
 - **pactl / wpctl / bluetoothctl / playerctl / brightnessctl / voxtype** - a
   verb list each, values but no options after the verb. No module loading,
   no remote server, no pairing or removing devices, no `playerctl open`.
