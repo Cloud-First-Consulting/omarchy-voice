@@ -52,7 +52,7 @@ LEARNED_MAX = 200
 # The last few turns, so a follow-up can be understood as an answer rather than
 # as a fresh request out of nowhere. Lives in the runtime directory because it
 # is a conversation, not a setting: it should not survive a reboot.
-HISTORY = pathlib.Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "omarchy-voice/history.json"
+HISTORY = pathlib.Path(os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/omarchy-voice-{os.getuid()}") / "omarchy-voice/history.json"
 HISTORY_TURNS = 4
 HISTORY_TTL = 180  # seconds; past this it is a new conversation, not a follow-up
 
@@ -285,7 +285,12 @@ def remember_turn(said, reply):
     turns = load_history()
     turns.append({"at": datetime.datetime.now().timestamp(), "said": said, "reply": reply})
     try:
-        HISTORY.parent.mkdir(parents=True, exist_ok=True)
+        HISTORY.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Private, and so is the fallback parent under /tmp when there is no
+        # XDG_RUNTIME_DIR: recordings and transcripts live here.
+        os.chmod(HISTORY.parent, 0o700)
+        if HISTORY.parent.parent.name.startswith("omarchy-voice-"):
+            os.chmod(HISTORY.parent.parent, 0o700)
         HISTORY.write_text(json.dumps(turns[-HISTORY_TURNS:]))
     except OSError:
         pass  # remembering is a convenience, never a reason to fail a command

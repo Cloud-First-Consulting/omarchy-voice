@@ -84,7 +84,7 @@ FRAME = 1280  # samples: 80ms, the window openWakeWord expects
 CHUNK = FRAME * 2  # bytes
 CONFIG = pathlib.Path.home() / ".config/omarchy/voice-wake.json"
 WAKE_DIR = pathlib.Path.home() / ".local/share/omarchy-wakeword"
-RUN_DIR = pathlib.Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "omarchy-voice"
+RUN_DIR = pathlib.Path(os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/omarchy-voice-{os.getuid()}") / "omarchy-voice"
 
 DEFAULTS = {
     "wake_words": ["hey marvin"],  # only the name is read from this now
@@ -327,7 +327,12 @@ STATE = RUN_DIR / "state.json"
 def write_state(**fields):
     """Record the listener's current state for anything watching it."""
     try:
-        RUN_DIR.mkdir(parents=True, exist_ok=True)
+        RUN_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Private, and so is the fallback parent under /tmp when there is no
+        # XDG_RUNTIME_DIR: recordings and transcripts live here.
+        os.chmod(RUN_DIR, 0o700)
+        if RUN_DIR.parent.name.startswith("omarchy-voice-"):
+            os.chmod(RUN_DIR.parent, 0o700)
         current = {}
         if STATE.exists():
             try:
@@ -482,7 +487,12 @@ def dispatch(audio, followup_secs=0.0):
         return
 
     try:
-        RUN_DIR.mkdir(parents=True, exist_ok=True)
+        RUN_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Private, and so is the fallback parent under /tmp when there is no
+        # XDG_RUNTIME_DIR: recordings and transcripts live here.
+        os.chmod(RUN_DIR, 0o700)
+        if RUN_DIR.parent.name.startswith("omarchy-voice-"):
+            os.chmod(RUN_DIR.parent, 0o700)
         path = RUN_DIR / "wake-command.wav"
         with wave.open(str(path), "wb") as wav:
             wav.setnchannels(1)

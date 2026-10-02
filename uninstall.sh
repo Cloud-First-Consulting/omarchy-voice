@@ -116,7 +116,7 @@ if (( purge )); then
         "$CONFIG_DIR/reference.txt" "$CONFIG_DIR/reference.version" \
         "$CONFIG_DIR/topics.txt" "$CONFIG_DIR/hotkeys.txt" \
         "$CONFIG_DIR/last-answer.md" "$CONFIG_DIR/last-diagnosis.md"
-  rm -rf "${XDG_RUNTIME_DIR:-/run/user/$UID}/omarchy-voice"
+  rm -rf "${XDG_RUNTIME_DIR:-/run/user/$UID}/omarchy-voice" "/tmp/omarchy-voice-$(id -u)"
   echo "  removed config, learned phrases and cached references"
 else
   echo "  kept ~/.config/omarchy/voice-wake.json and learned state (--purge removes them)"

@@ -52,7 +52,7 @@ warnings.filterwarnings("ignore", message=".*CUDAExecutionProvider.*")
 CONFIG = pathlib.Path.home() / ".config/omarchy/voice-wake.json"
 WAKE_DIR = pathlib.Path.home() / ".local/share/omarchy-wakeword"
 PIPER = pathlib.Path.home() / ".local/share/piper"
-LAST_WAV = pathlib.Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "omarchy-voice/wake-command.wav"
+LAST_WAV = pathlib.Path(os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/omarchy-voice-{os.getuid()}") / "omarchy-voice/wake-command.wav"
 FRAME = 1280
 
 # Two kinds of negative, and both earn their place. The first four appear in the
@@ -174,7 +174,7 @@ def main():
         print(f"{peak:.3f} peak, held {held} frames  {args.wav}")
         return 0
 
-    tmp = pathlib.Path(os.environ.get("TMPDIR", "/tmp")) / "omarchy-wake-test.wav"
+    tmp = LAST_WAV.parent / "wake-test.wav"
     print(f"model            {name}")
     print(f"threshold        {threshold}")
     print(f"frames to wake   {wake_frames}\n")

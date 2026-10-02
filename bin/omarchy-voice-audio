@@ -55,7 +55,7 @@ LEVELS_MAX_AGE = 6 * 3600
 # Matches the listener's own thresholds; see pick_builtin_mic there.
 SIGNAL_FLOOR = 120.0
 SIGNAL_RATIO = 4.0
-STATE = pathlib.Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "omarchy-voice/state.json"
+STATE = pathlib.Path(os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/omarchy-voice-{os.getuid()}") / "omarchy-voice/state.json"
 UNIT = "omarchy-voice-wake"
 
 

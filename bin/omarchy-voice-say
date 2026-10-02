@@ -26,7 +26,7 @@ set -uo pipefail
 
 PIPER_DIR="$HOME/.local/share/piper"
 CONFIG="$HOME/.config/omarchy/voice-wake.json"
-RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/omarchy-voice"
+RUN_DIR="${XDG_RUNTIME_DIR:-/tmp/omarchy-voice-$(id -u)}/omarchy-voice"
 FLAG="$RUN_DIR/speaking"
 
 # Echo does not stop when the samples do: the headset has latency and the room
@@ -88,7 +88,7 @@ fi
 # reaches for even when told to write one plain sentence.
 spoken=$(printf '%s' "$text" | sed -E 's/[`*_#|]//g; s/[󰀦󰄬󰍬󰍭󰚩󰅧󰜺󰋗]//g; s/  +/ /g')
 
-mkdir -p "$RUN_DIR"
+mkdir -p "$RUN_DIR" && chmod 700 "$RUN_DIR"
 # shellcheck disable=SC2064
 trap "rm -f '$FLAG'" EXIT
 
